@@ -464,9 +464,30 @@ refreshes to cascade auto-start to unblocked tickets."
                    (agent-shell-dispatch-report (plist-get task :id) "done"))))
              (agent-shell-dispatch-wayfinder-refresh))))))))
 
+(defun agent-shell-dispatch-wayfinder--ticket-prompt (ticket backend file body)
+  "Return the initial prompt for an agent working TICKET.
+BACKEND is `local' or `github'.  For `local', FILE is the ticket file and
+BODY its text.  The prompt ends with how to resolve the ticket, so the
+tracker records the answer rather than leaving the ticket claimed."
+  (let ((name (plist-get ticket :name)))
+    (concat
+     (format "Work on: %s\n\n" name)
+     (if body (concat body "\n\n") "")
+     (pcase backend
+       ('local
+        (format "When you are done, resolve the ticket in %s: append your answer \
+under an \"## Answer\" heading and change its status line to \"Status: resolved\"."
+                file))
+       ('github
+        (format "When you are done, post your answer and close the issue with \
+`gh issue close %s --comment \"<answer>\"`."
+                (plist-get ticket :id)))))))
+
 (defun agent-shell-dispatch-wayfinder-start-ticket (id &optional message)
   "Claim ticket ID, spawn an agent for it, and mark it working.
-MESSAGE overrides the default initial prompt (the ticket body).
+MESSAGE overrides the default initial prompt, which is the ticket body
+plus instructions to resolve the ticket (see
+`agent-shell-dispatch-wayfinder--ticket-prompt').
 Requires an active wayfinder effort."
   (interactive "sTicket ID: ")
   (let ((buf (agent-shell-dispatch-wayfinder--dispatch-buffer)))
@@ -485,56 +506,52 @@ Requires an active wayfinder effort."
           (user-error "Ticket %s not found in effort %s" id effort))
         (when (equal (plist-get ticket :status) "resolved")
           (user-error "Ticket %s is already resolved" id))
-        ;; Claim in the tracker
-        (pcase backend
-          ('local
-           (when-let* ((file (agent-shell-dispatch-wayfinder--local-find-file effort id)))
-             (agent-shell-dispatch-wayfinder--local-set-status file "claimed")))
-          ('github
-           (agent-shell-dispatch-wayfinder--github-claim-ticket id-normalized)))
-        ;; Ensure the graph is rendered (idempotent if already active)
-        (unless agent-shell-dispatch-render-mode
-          (let ((tasks (agent-shell-dispatch-wayfinder--tickets-to-tasks
-                        (agent-shell-dispatch-wayfinder--scan-tickets effort backend))))
-            (agent-shell-dispatch-start-current tasks)))
-        ;; Build the initial message for the agent
-        (let* ((name (plist-get ticket :name))
-               (agent-name
-                (pcase backend
-                  ('local
-                   (when-let* ((file (agent-shell-dispatch-wayfinder--local-find-file effort id)))
-                     (file-name-sans-extension (file-name-nondirectory file))))
-                  (_ (format "%s-%s"
-                             id-normalized
-                             (replace-regexp-in-string "[^a-z0-9]+" "-"
-                                                      (downcase name))))))
-               (body (pcase backend
-                       ('local
-                        (when-let* ((file (agent-shell-dispatch-wayfinder--local-find-file effort id)))
-                          (agent-shell-dispatch-wayfinder--local-ticket-body file)))
-                       (_ nil)))
-               (prompt (or message
-                           (format "Work on: %s\n\n%s" name (or body "")))))
-          ;; Spawn the agent and wire it to this task
-          (let ((agent-buf (agent-shell-dispatch-spawn-agent default-directory agent-name prompt)))
-            (when agent-buf
-              (setq agent-shell-dispatch-msg--pending-permission-agents
-                    (delete agent-buf agent-shell-dispatch-msg--pending-permission-agents))
-              (when-let* ((state agent-shell-dispatch--state)
-                          (task (cl-find-if
-                                 (lambda (t_) (equal (plist-get t_ :id) id-normalized))
-                                 (agent-shell-dispatch-state-tasks state))))
-                (plist-put task :agent agent-buf))
-              ;; Subscribe to subagent completion to trigger auto-start cascade
-              (agent-shell-subscribe-to
-               :shell-buffer (get-buffer agent-buf)
-               :event 'turn-complete
-               :on-event (lambda (_event)
-                           (agent-shell-dispatch-wayfinder--on-agent-complete)))))
-          ;; Report working and refresh
-          (agent-shell-dispatch-report id-normalized "working")
-          (agent-shell-dispatch-wayfinder-refresh)
-          (message "Wayfinder: started ticket %s — %s" id-normalized name))))))
+        (let ((file (and (eq backend 'local)
+                         (agent-shell-dispatch-wayfinder--local-find-file effort id))))
+          ;; Claim in the tracker
+          (pcase backend
+            ('local
+             (when file
+               (agent-shell-dispatch-wayfinder--local-set-status file "claimed")))
+            ('github
+             (agent-shell-dispatch-wayfinder--github-claim-ticket id-normalized)))
+          ;; Ensure the graph is rendered (idempotent if already active)
+          (unless agent-shell-dispatch-render-mode
+            (let ((tasks (agent-shell-dispatch-wayfinder--tickets-to-tasks
+                          (agent-shell-dispatch-wayfinder--scan-tickets effort backend))))
+              (agent-shell-dispatch-start-current tasks)))
+          ;; Build the initial message for the agent
+          (let* ((name (plist-get ticket :name))
+                 (agent-name
+                  (if file
+                      (file-name-sans-extension (file-name-nondirectory file))
+                    (format "%s-%s"
+                            id-normalized
+                            (replace-regexp-in-string "[^a-z0-9]+" "-" (downcase name)))))
+                 (body (and file (agent-shell-dispatch-wayfinder--local-ticket-body file)))
+                 (prompt (or message
+                             (agent-shell-dispatch-wayfinder--ticket-prompt
+                              ticket backend file body))))
+            ;; Spawn the agent and wire it to this task
+            (let ((agent-buf (agent-shell-dispatch-spawn-agent default-directory agent-name prompt)))
+              (when agent-buf
+                (setq agent-shell-dispatch-msg--pending-permission-agents
+                      (delete agent-buf agent-shell-dispatch-msg--pending-permission-agents))
+                (when-let* ((state agent-shell-dispatch--state)
+                            (task (cl-find-if
+                                   (lambda (t_) (equal (plist-get t_ :id) id-normalized))
+                                   (agent-shell-dispatch-state-tasks state))))
+                  (plist-put task :agent agent-buf))
+                ;; Subscribe to subagent completion to trigger auto-start cascade
+                (agent-shell-subscribe-to
+                 :shell-buffer (get-buffer agent-buf)
+                 :event 'turn-complete
+                 :on-event (lambda (_event)
+                             (agent-shell-dispatch-wayfinder--on-agent-complete)))))
+            ;; Report working and refresh
+            (agent-shell-dispatch-report id-normalized "working")
+            (agent-shell-dispatch-wayfinder-refresh)
+            (message "Wayfinder: started ticket %s — %s" id-normalized name)))))))
 
 (provide 'agent-shell-dispatch-wayfinder)
 ;;; agent-shell-dispatch-wayfinder.el ends here

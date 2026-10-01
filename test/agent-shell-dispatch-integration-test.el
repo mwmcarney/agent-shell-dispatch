@@ -12,6 +12,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'subr-x)
 
 ;; ── External dependency stubs ─────────────────────────────────────────
 
@@ -1040,6 +1041,43 @@ caller's directory over the selected window's shell and spawned agents."
       (agent-shell-dispatch-test--emit-agent-call "toolu_1")
       (should-not (agent-shell-dispatch-test--task "toolu_1")))
     (agent-shell-dispatch-stop)))
+
+(ert-deftest subagent-finished-foreground-calls-stop-being-tracked ()
+  "Foreground subagents leave the tracking table once they finish; running
+background subagents stay tracked until the turn completes."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+    (agent-shell-dispatch-test--emit-agent-call "toolu_ok" :description "Research: ok")
+    (agent-shell-dispatch-test--emit-agent-call "toolu_ok" :description "Research: ok"
+                                                :status "completed")
+    (agent-shell-dispatch-test--emit-agent-call "toolu_bad" :description "Research: bad"
+                                                :status "failed")
+    (agent-shell-dispatch-test--emit-agent-call "toolu_bg" :description "Research: bg"
+                                                :background t :status "completed")
+    (should (eq 'done (agent-shell-dispatch-test--status "toolu_ok")))
+    (should (eq 'error (agent-shell-dispatch-test--status "toolu_bad")))
+    (should (equal '("toolu_bg")
+                   (hash-table-keys (agent-shell-dispatch-state-subagents
+                                     agent-shell-dispatch--state))))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest wayfinder-local-ticket-prompt-asks-agent-to-resolve ()
+  "The default local ticket prompt carries the ticket and how to resolve it."
+  (let ((prompt (agent-shell-dispatch-wayfinder--ticket-prompt
+                 '(:id "3" :name "summarize") 'local
+                 "/work/.scratch/fx/issues/03-summarize.md" "Write the summary.")))
+    (should (string-match-p "Work on: summarize" prompt))
+    (should (string-match-p "Write the summary\\." prompt))
+    (should (string-match-p (regexp-quote "/work/.scratch/fx/issues/03-summarize.md") prompt))
+    (should (string-match-p "## Answer" prompt))
+    (should (string-match-p "Status: resolved" prompt))))
+
+(ert-deftest wayfinder-github-ticket-prompt-asks-agent-to-close-issue ()
+  "The default GitHub ticket prompt tells the agent to close its issue."
+  (let ((prompt (agent-shell-dispatch-wayfinder--ticket-prompt
+                 '(:id "7" :name "probe api") 'github nil nil)))
+    (should (string-match-p "Work on: probe api" prompt))
+    (should (string-match-p "gh issue close 7" prompt))))
 
 (provide 'agent-shell-dispatch-integration-test)
 ;;; agent-shell-dispatch-integration-test.el ends here

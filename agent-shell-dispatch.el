@@ -492,17 +492,20 @@ ticket.  Otherwise TOOL-CALL is added as a new task keyed by TOOL-CALL-ID."
                    subagents)))))
 
 (defun agent-shell-dispatch--on-tool-call-update (event)
-  "Reflect an Agent tool call in EVENT as a dispatch task status."
+  "Reflect an Agent tool call in EVENT as a dispatch task status.
+A subagent stops being tracked once it reaches a final status."
   (when-let* ((agent-shell-dispatch--state)
               (data (map-elt event :data))
               (tool-call-id (map-elt data :tool-call-id))
               (tool-call (map-elt data :tool-call))
               ((agent-shell-dispatch--subagent-call-p tool-call)))
-    (let ((info (agent-shell-dispatch--track-subagent tool-call-id tool-call)))
-      (agent-shell-dispatch--record-report
-       (plist-get info :task-id)
-       (agent-shell-dispatch--subagent-status (map-elt tool-call :status)
-                                              (plist-get info :background))))))
+    (let* ((info (agent-shell-dispatch--track-subagent tool-call-id tool-call))
+           (status (agent-shell-dispatch--subagent-status
+                    (map-elt tool-call :status) (plist-get info :background))))
+      (agent-shell-dispatch--record-report (plist-get info :task-id) status)
+      (unless (equal status "working")
+        (remhash tool-call-id
+                 (agent-shell-dispatch-state-subagents agent-shell-dispatch--state))))))
 
 (defun agent-shell-dispatch--settle-background-subagents ()
   "Mark background subagents that are still working as done.
