@@ -9,6 +9,7 @@ Multi-agent dispatch and coordination for [agent-shell](https://github.com/xenod
 - **Live SVG task graph** -- dependency-aware DAG rendered in the header line with status colors and state indicators
 - **Explicit status model** -- tasks are `not-started`, `working`, `done`, `error`, `permission`, or `dead`, driven entirely by explicit reports (no process-state guessing)
 - **Parallel agent spawning** -- launch background agent-shell sessions that work independently
+- **Subagent tracking** -- Claude Code subagents (the Agent tool) launched by the dispatcher appear as graph nodes automatically, with live status and no report calls
 - **Permission forwarding** -- tool permission requests from background agents show as a lock icon in the SVG header; the native permission UI appears in the subagent's own buffer by default (optionally rendered in the dispatcher via `agent-shell-dispatch-msg-show-permissions-in-dispatcher`)
 - **Inter-agent messaging** -- typed message protocol for progress reports, error reports, input requests, and completion notifications
 - **Dispatcher pattern** -- the primary agent coordinates without implementing; subagents communicate via messages only, and the dispatcher owns all task graph updates
@@ -122,6 +123,24 @@ The agent becomes the dispatcher: it spawns implementation agents, assigns tasks
 5. **On error**, subagent sends an `error` message; dispatcher marks `error`
 
 The dispatcher owns all task graph transitions. Subagents cannot call `agent-shell-dispatch-report` or `agent-shell-dispatch-start`.
+
+#### Subagents vs. spawned sessions
+
+There are two ways to run work in parallel:
+
+| | Claude Code subagent (Agent tool) | Spawned session (`agent-shell-dispatch-spawn-agent`) |
+|---|---|---|
+| Started by | The model, from inside the dispatcher's session | Emacs or the model, via elisp |
+| Runs in | The dispatcher's own claude-code-acp session | Its own `[agent:NAME]` buffer and process |
+| Status in the graph | Automatic, from the tool call's status | Explicit `agent-shell-dispatch-report` calls |
+| Steerable mid-task | No | Yes (`agent-shell-dispatch-send-to-agent`, or type in its buffer) |
+| Good for | Short, fire-and-forget work such as wayfinder "Research: ..." questions | Ticket work, `start-ticket`, and the auto-start cascade |
+
+While a graph is active, every Agent tool call in the dispatcher buffer becomes a node, named after the call's `description`. The node shows `working` while the call is pending or in progress, `done` when it completes and `error` if it fails. Other tool calls are ignored. If the description or prompt names a ticket that is already in the graph, the status goes to that ticket instead of a new node. A ticket counts as named when the text says `ticket 3`, `ticket #3` or `#3`, or contains its local file name (`03-slug`). Bare numbers don't count.
+
+Background subagents (`run_in_background`) are tracked until they finish. claude-agent-acp completes their tool call as soon as they launch, but it holds the dispatcher's turn open until they drain. The node therefore stays `working` until the dispatcher's turn completes, then becomes `done`. The one limitation is that a background subagent which fails after launching still shows as `done`, because no failure status reaches Emacs.
+
+Set `agent-shell-dispatch-track-subagents` to `nil` to turn tracking off. The setting takes effect at the next `agent-shell-dispatch-start`.
 
 ### 4. (Optional) Wayfinder integration
 
@@ -246,6 +265,7 @@ All dispatch and render state is buffer-local, so multiple independent dispatch 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `agent-shell-dispatch-track-subagents` | `t` | Show the dispatcher's Claude Code subagents (Agent tool calls) as graph nodes |
 | `agent-shell-dispatch-wayfinder-auto-start` | `t` | Automatically start tickets whose blockers are all done |
 | `agent-shell-dispatch-wayfinder-poll-interval` | `5.0` | Seconds between GitHub backend poll refreshes |
 | `agent-shell-dispatch-msg-show-permissions-in-dispatcher` | `nil` | Render permission fragments in the dispatcher buffer (SVG lock icon always shows regardless) |

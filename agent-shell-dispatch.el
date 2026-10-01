@@ -37,6 +37,17 @@
 (defun agent-shell-dispatch--global-dummy (&rest _)
   "No-op turn-on function for the globalized minor mode.")
 
+(defgroup agent-shell-dispatch nil
+  "Multi-agent dispatch for agent-shell."
+  :group 'agent-shell)
+
+(defcustom agent-shell-dispatch-track-subagents t
+  "When non-nil, show the dispatcher's Claude Code subagents in the task graph.
+Each Agent tool call becomes a node whose status follows the tool call.
+Takes effect the next time `agent-shell-dispatch-start' runs."
+  :type 'boolean
+  :group 'agent-shell-dispatch)
+
 
 ;; -- Permission forwarding from background agents to dispatcher buffer --
 
@@ -300,12 +311,9 @@ TASKS is a list of plists: ((:id ID :name NAME :agent AGENT-BUF) ...)."
            :tasks normalized
            :statuses (make-hash-table :test 'equal)
            :agents (make-hash-table :test 'equal)
-           :turn-complete-subscription
-           (agent-shell-subscribe-to
-            :shell-buffer (get-buffer dispatcher-buffer)
-            :event 'turn-complete
-            :on-event (lambda (_event)
-                        (agent-shell-dispatch--drain-queue)))))
+           :subagents (make-hash-table :test 'equal)
+           :subscriptions
+           (agent-shell-dispatch--subscribe (get-buffer dispatcher-buffer))))
     ;; Auto-enable global mode if not already on
     (unless agent-shell-dispatch-global-mode
       (agent-shell-dispatch-global-mode 1))
@@ -412,6 +420,122 @@ Returns non-nil if a task was removed."
         (agent-shell-dispatch--rebuild-render-ctx)
         t))))
 
+;; ── Claude Code subagent tracking ──────────────────────────────────────
+;;
+;; Subagents run inside the dispatcher's own session, so dispatch observes
+;; them through agent-shell's `tool-call-update' event rather than spawning
+;; them.  Verified against claude-agent-acp 0.70.0.
+
+(defconst agent-shell-dispatch--ticket-reference-regexp
+  (rx (or (seq word-boundary "ticket" (* space) (? "#") (group-n 1 (+ digit)))
+          (seq "#" (group-n 1 (+ digit)))
+          ;; Local wayfinder ticket file names, e.g. 03-do-the-thing.md
+          (seq word-boundary (group-n 1 (+ digit)) "-" alpha)))
+  "Regexp matching a wayfinder ticket reference; group 1 is the ID.")
+
+(defun agent-shell-dispatch--subagent-call-p (tool-call)
+  "Return non-nil when TOOL-CALL is a Claude Code Agent (subagent) call.
+claude-agent-acp titles Agent calls by their description rather than the
+tool name, so they are recognized by kind \"think\" plus a prompt in the
+raw input.  The task-list tools share the kind but carry no prompt."
+  (and (equal (map-elt tool-call :kind) "think")
+       (map-elt (map-elt tool-call :raw-input) 'prompt)))
+
+(defun agent-shell-dispatch--referenced-ticket (texts task-ids)
+  "Return the first of TASK-IDS that one of TEXTS references as a ticket.
+Bare numbers are not references; see
+`agent-shell-dispatch--ticket-reference-regexp'."
+  (let ((case-fold-search t))
+    (cl-loop for text in texts
+             thereis
+             (and (stringp text)
+                  (let ((pos 0) found)
+                    (while (and (not found)
+                                (string-match agent-shell-dispatch--ticket-reference-regexp
+                                              text pos))
+                      (let ((id (number-to-string
+                                 (string-to-number (match-string 1 text)))))
+                        (when (member id task-ids)
+                          (setq found id)))
+                      (setq pos (match-end 0)))
+                    found)))))
+
+(defun agent-shell-dispatch--subagent-status (tool-status background)
+  "Map ACP TOOL-STATUS to a dispatch status string.
+A BACKGROUND call completes as soon as the subagent launches, so it
+stays working until the dispatcher's turn completes."
+  (pcase tool-status
+    ("failed" "error")
+    ("completed" (if background "working" "done"))
+    (_ "working")))
+
+(defun agent-shell-dispatch--track-subagent (tool-call-id tool-call)
+  "Return the tracking plist for TOOL-CALL-ID, registering it on first sight.
+A subagent that references a ticket already in the graph reports to that
+ticket.  Otherwise TOOL-CALL is added as a new task keyed by TOOL-CALL-ID."
+  (let* ((state agent-shell-dispatch--state)
+         (subagents (agent-shell-dispatch-state-subagents state)))
+    (or (gethash tool-call-id subagents)
+        (let* ((raw (map-elt tool-call :raw-input))
+               (description (map-elt raw 'description))
+               (ticket (agent-shell-dispatch--referenced-ticket
+                        (list description (map-elt raw 'prompt))
+                        (mapcar (lambda (task) (plist-get task :id))
+                                (agent-shell-dispatch-state-tasks state)))))
+          (unless ticket
+            (agent-shell-dispatch-add-task
+             (list :id tool-call-id
+                   :name (or description (map-elt tool-call :title)))))
+          (puthash tool-call-id
+                   (list :task-id (or ticket tool-call-id)
+                         :background (and (map-elt raw 'run_in_background) t))
+                   subagents)))))
+
+(defun agent-shell-dispatch--on-tool-call-update (event)
+  "Reflect an Agent tool call in EVENT as a dispatch task status."
+  (when-let* ((agent-shell-dispatch--state)
+              (data (map-elt event :data))
+              (tool-call-id (map-elt data :tool-call-id))
+              (tool-call (map-elt data :tool-call))
+              ((agent-shell-dispatch--subagent-call-p tool-call)))
+    (let ((info (agent-shell-dispatch--track-subagent tool-call-id tool-call)))
+      (agent-shell-dispatch--record-report
+       (plist-get info :task-id)
+       (agent-shell-dispatch--subagent-status (map-elt tool-call :status)
+                                              (plist-get info :background))))))
+
+(defun agent-shell-dispatch--settle-background-subagents ()
+  "Mark background subagents that are still working as done.
+claude-agent-acp holds the prompt turn open until the background subagents
+it spawned finish, so the dispatcher's turn completion is their completion
+signal.  Settled subagents stop being tracked."
+  (when-let* ((state agent-shell-dispatch--state))
+    (let ((subagents (agent-shell-dispatch-state-subagents state))
+          (statuses (agent-shell-dispatch-state-statuses state)))
+      (maphash (lambda (tool-call-id info)
+                 (when (plist-get info :background)
+                   (let* ((task-id (plist-get info :task-id))
+                          (reported (gethash task-id statuses)))
+                     (when (and reported
+                                (eq 'working (agent-shell-dispatch-reported-status-status
+                                              reported)))
+                       (agent-shell-dispatch--record-report task-id "done")))
+                   (remhash tool-call-id subagents)))
+               subagents))))
+
+(defun agent-shell-dispatch--subscribe (dispatcher-buffer)
+  "Subscribe to DISPATCHER-BUFFER events and return the subscription tokens."
+  (cons (agent-shell-subscribe-to
+         :shell-buffer dispatcher-buffer
+         :event 'turn-complete
+         :on-event (lambda (_event)
+                     (agent-shell-dispatch--settle-background-subagents)
+                     (agent-shell-dispatch--drain-queue)))
+        (when agent-shell-dispatch-track-subagents
+          (list (agent-shell-subscribe-to
+                 :shell-buffer dispatcher-buffer
+                 :event 'tool-call-update
+                 :on-event #'agent-shell-dispatch--on-tool-call-update)))))
 
 (defun agent-shell-dispatch-stop ()
   "Stop rendering. State preserved for mode toggle."
@@ -593,10 +717,6 @@ Returns t on success, nil if buffer not found."
     t))
 
 ;; -- Global minor mode --
-
-(defgroup agent-shell-dispatch nil
-  "Multi-agent dispatch for agent-shell."
-  :group 'agent-shell)
 
 (define-globalized-minor-mode agent-shell-dispatch-global-mode
   agent-shell-dispatch--global-dummy

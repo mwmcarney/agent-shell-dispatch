@@ -29,8 +29,17 @@
   (defun agent-shell--update-header-and-mode-line () nil)
   (defun agent-shell--make-permission-button (&rest args)
     (or (plist-get args :text) "[btn]"))
-  (defun agent-shell-subscribe-to (&rest _) 'test-subscription-token)
-  (defun agent-shell-unsubscribe (&rest _) nil)
+  ;; Subscriptions are recorded so tests can emit events through the same
+  ;; path agent-shell uses.  Each entry is (TOKEN BUFFER EVENT ON-EVENT).
+  (defvar agent-shell-test--subscriptions nil)
+  (defvar agent-shell-test--subscription-counter 0)
+  (cl-defun agent-shell-subscribe-to (&key shell-buffer event on-event)
+    (let ((token (cl-incf agent-shell-test--subscription-counter)))
+      (push (list token shell-buffer event on-event) agent-shell-test--subscriptions)
+      token))
+  (cl-defun agent-shell-unsubscribe (&key subscription)
+    (setq agent-shell-test--subscriptions
+          (cl-remove subscription agent-shell-test--subscriptions :key #'car)))
   (defun agent-shell-interrupt (&optional _) nil)
   (defun agent-shell-diff (&rest _) nil)
   (defun agent-shell-anthropic-make-claude-code-config () nil)
@@ -123,6 +132,53 @@ preventing tasks from resolving to `dead'."
              (set-process-query-on-exit-flag proc nil)
              (delete-process proc))
            (kill-buffer buf))))))
+
+(defun agent-shell-dispatch-test--emit (buffer event &optional data)
+  "Deliver EVENT with DATA to subscribers of BUFFER, as agent-shell does."
+  (dolist (sub agent-shell-test--subscriptions)
+    (pcase-let ((`(,_token ,sub-buf ,sub-event ,on-event) sub))
+      (when (and (eq sub-buf buffer)
+                 (or (null sub-event) (eq sub-event event)))
+        (with-current-buffer buffer
+          (funcall on-event (list (cons :event event) (cons :data data))))))))
+
+(defun agent-shell-dispatch-test--subscribed-p (buffer event)
+  "Return non-nil when BUFFER has a subscription for EVENT."
+  (cl-some (lambda (sub) (and (eq (nth 1 sub) buffer) (eq (nth 2 sub) event)))
+           agent-shell-test--subscriptions))
+
+(cl-defun agent-shell-dispatch-test--emit-tool-call
+    (id &key (status "pending") (kind "think") title raw-input)
+  "Emit a `tool-call-update' for tool call ID in the current buffer.
+The tool call alist mirrors what agent-shell stores from ACP notifications."
+  (agent-shell-dispatch-test--emit
+   (current-buffer) 'tool-call-update
+   (list (cons :tool-call-id id)
+         (cons :tool-call (list (cons :title title)
+                                (cons :status status)
+                                (cons :kind kind)
+                                (cons :raw-input raw-input))))))
+
+(cl-defun agent-shell-dispatch-test--emit-agent-call
+    (id &key (status "pending") (description "Research: caching") prompt background)
+  "Emit a `tool-call-update' for an Agent tool call ID.
+claude-agent-acp titles Agent calls with their description and kind `think'."
+  (agent-shell-dispatch-test--emit-tool-call
+   id :status status :title description
+   :raw-input `((description . ,description)
+                (prompt . ,(or prompt "Investigate the question."))
+                (subagent_type . "general-purpose")
+                (run_in_background . ,background))))
+
+(defun agent-shell-dispatch-test--task (id)
+  "Return the dispatch task plist with ID, or nil."
+  (cl-find id (agent-shell-dispatch-state-tasks agent-shell-dispatch--state)
+           :key (lambda (task) (plist-get task :id)) :test #'equal))
+
+(defun agent-shell-dispatch-test--status (id)
+  "Return the rendered status symbol for task ID."
+  (agent-shell-dispatch-render-task-status-status
+   (gethash id (agent-shell-dispatch--build-status-map))))
 
 (defun test-tasks-simple ()
   "Return a simple three-task graph: A -> B -> C."
@@ -827,6 +883,162 @@ caller's directory over the selected window's shell and spawned agents."
                             (gethash "c" sm))))
         (should (eq 'not-started (agent-shell-dispatch-render-task-status-status
                                   (gethash "d" sm))))))
+    (agent-shell-dispatch-stop)))
+
+;; ── Claude Code subagent tracking ─────────────────────────────────────
+
+(ert-deftest subagent-agent-call-adds-task-node ()
+  "An Agent tool call adds a node keyed by tool call ID, named by description."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+    (agent-shell-dispatch-test--emit-agent-call "toolu_1" :description "Research: caching")
+    (let ((task (agent-shell-dispatch-test--task "toolu_1")))
+      (should task)
+      (should (equal "Research: caching" (plist-get task :name))))
+    (should (= 4 (length (agent-shell-dispatch-state-tasks agent-shell-dispatch--state))))
+    (let ((leveled (agent-shell-dispatch-render-topology-leveled
+                    (agent-shell-dispatch-render-ctx-topo agent-shell-dispatch-render--ctx))))
+      (should (cl-find "toolu_1" leveled :key (lambda (task) (plist-get task :id)) :test #'equal)))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest subagent-name-falls-back-to-title ()
+  "Without a description, the node is named after the tool call title."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+    (agent-shell-dispatch-test--emit-tool-call
+     "toolu_1" :title "Task" :raw-input '((prompt . "Look into it.")))
+    (should (equal "Task" (plist-get (agent-shell-dispatch-test--task "toolu_1") :name)))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest subagent-status-follows-tool-call-status ()
+  "pending and in_progress render working, completed done, failed error."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+    (let ((shell-maker-busy-val t))
+      (agent-shell-dispatch-test--emit-agent-call "toolu_1" :status "pending")
+      (should (eq 'working (agent-shell-dispatch-test--status "toolu_1")))
+      (agent-shell-dispatch-test--emit-agent-call "toolu_1" :status "in_progress")
+      (should (eq 'working (agent-shell-dispatch-test--status "toolu_1")))
+      (agent-shell-dispatch-test--emit-agent-call "toolu_1" :status "completed")
+      (should (eq 'done (agent-shell-dispatch-test--status "toolu_1")))
+      (agent-shell-dispatch-test--emit-agent-call "toolu_2" :status "in_progress")
+      (agent-shell-dispatch-test--emit-agent-call "toolu_2" :status "failed")
+      (should (eq 'error (agent-shell-dispatch-test--status "toolu_2"))))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest subagent-non-agent-tool-calls-ignored ()
+  "Bash, Read, WebFetch and task-list tool calls do not add nodes."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+    (agent-shell-dispatch-test--emit-tool-call
+     "toolu_bash" :kind "execute" :title "ls" :raw-input '((command . "ls")))
+    (agent-shell-dispatch-test--emit-tool-call
+     "toolu_read" :kind "read" :title "Read foo.el" :raw-input '((file_path . "foo.el")))
+    (agent-shell-dispatch-test--emit-tool-call
+     "toolu_fetch" :kind "fetch" :title "Fetch"
+     :raw-input '((url . "https://example.com") (prompt . "Summarize")))
+    (agent-shell-dispatch-test--emit-tool-call
+     "toolu_todo" :kind "think" :title "TaskCreate"
+     :raw-input '((subject . "x") (description . "y")))
+    (should (= 3 (length (agent-shell-dispatch-state-tasks agent-shell-dispatch--state))))
+    (should (= 0 (hash-table-count
+                  (agent-shell-dispatch-state-statuses agent-shell-dispatch--state))))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest subagent-repeat-updates-do-not-duplicate ()
+  "Repeat updates for one tool call ID update a single node."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+    (agent-shell-dispatch-test--emit-agent-call "toolu_1" :status "pending")
+    (agent-shell-dispatch-test--emit-agent-call "toolu_1" :status "in_progress")
+    (agent-shell-dispatch-test--emit-agent-call "toolu_1" :status "completed")
+    (should (= 1 (cl-count "toolu_1" (agent-shell-dispatch-state-tasks agent-shell-dispatch--state)
+                           :key (lambda (task) (plist-get task :id)) :test #'equal)))
+    (should (eq 'done (agent-shell-dispatch-test--status "toolu_1")))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest subagent-ticket-reference-routes-status-to-ticket ()
+  "A subagent naming a graph ticket updates that ticket instead of adding a node."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start
+     (buffer-name)
+     (list (list :id "1" :name "1 [T] First" :depends-on nil)
+           (list :id "2" :name "2 [R] Second" :depends-on '("1"))))
+    (let ((shell-maker-busy-val t))
+      ;; Named in the description
+      (agent-shell-dispatch-test--emit-agent-call
+       "toolu_1" :description "Research ticket 2: cache eviction")
+      (should (eq 'working (agent-shell-dispatch-test--status "2")))
+      (agent-shell-dispatch-test--emit-agent-call
+       "toolu_1" :description "Research ticket 2: cache eviction" :status "completed")
+      (should (eq 'done (agent-shell-dispatch-test--status "2")))
+      ;; Named in the prompt by its local ticket file name
+      (agent-shell-dispatch-test--emit-agent-call
+       "toolu_2" :description "Research: schema"
+       :prompt "Answer the question in .scratch/x/issues/01-first.md")
+      (should (eq 'working (agent-shell-dispatch-test--status "1"))))
+    (should (= 2 (length (agent-shell-dispatch-state-tasks agent-shell-dispatch--state))))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest subagent-unknown-ticket-reference-adds-node ()
+  "A ticket reference that is not in the graph, or a bare number, adds a node."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start
+     (buffer-name)
+     (list (list :id "1" :name "1 [T] First" :depends-on nil)))
+    (agent-shell-dispatch-test--emit-agent-call "toolu_1" :description "Research ticket #9")
+    (agent-shell-dispatch-test--emit-agent-call "toolu_2" :description "Compare 1 vs 2 options")
+    (should (agent-shell-dispatch-test--task "toolu_1"))
+    (should (agent-shell-dispatch-test--task "toolu_2"))
+    (should-not (gethash "1" (agent-shell-dispatch-state-statuses agent-shell-dispatch--state)))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest subagent-background-tracked-until-turn-complete ()
+  "A background subagent stays working after its launch ack until the turn ends."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+    (let ((shell-maker-busy-val t))
+      (agent-shell-dispatch-test--emit-agent-call "toolu_bg" :background t)
+      ;; claude-agent-acp completes a background Agent call as soon as it launches
+      (agent-shell-dispatch-test--emit-agent-call "toolu_bg" :background t :status "completed")
+      (should (eq 'working (agent-shell-dispatch-test--status "toolu_bg"))))
+    ;; The prompt turn is held open until background subagents drain
+    (agent-shell-dispatch-test--emit (current-buffer) 'turn-complete)
+    (should (eq 'done (agent-shell-dispatch-reported-status-status
+                       (gethash "toolu_bg" (agent-shell-dispatch-state-statuses
+                                            agent-shell-dispatch--state)))))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest subagent-background-failure-is-error ()
+  "A background subagent that fails to launch shows as error."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+    (agent-shell-dispatch-test--emit-agent-call "toolu_bg" :background t)
+    (agent-shell-dispatch-test--emit-agent-call "toolu_bg" :background t :status "failed")
+    (agent-shell-dispatch-test--emit (current-buffer) 'turn-complete)
+    (should (eq 'error (agent-shell-dispatch-test--status "toolu_bg")))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest subagent-teardown-unsubscribes ()
+  "Render teardown removes the tool-call subscription."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+    (should (agent-shell-dispatch-test--subscribed-p (current-buffer) 'tool-call-update))
+    (agent-shell-dispatch-render-teardown)
+    (should-not (agent-shell-dispatch-test--subscribed-p (current-buffer) 'tool-call-update))
+    (should-not (agent-shell-dispatch-test--subscribed-p (current-buffer) 'turn-complete))
+    (should-not agent-shell-dispatch--state)
+    ;; Late events after teardown are harmless no-ops
+    (agent-shell-dispatch-test--emit-agent-call "toolu_late")))
+
+(ert-deftest subagent-tracking-disabled-by-defcustom ()
+  "With tracking off, no tool-call subscription is made and no nodes appear."
+  (with-dispatch-buffer
+    (let ((agent-shell-dispatch-track-subagents nil))
+      (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+      (should-not (agent-shell-dispatch-test--subscribed-p (current-buffer) 'tool-call-update))
+      (agent-shell-dispatch-test--emit-agent-call "toolu_1")
+      (should-not (agent-shell-dispatch-test--task "toolu_1")))
     (agent-shell-dispatch-stop)))
 
 (provide 'agent-shell-dispatch-integration-test)

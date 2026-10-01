@@ -17,8 +17,11 @@
 (cl-defstruct (agent-shell-dispatch-state
                (:constructor agent-shell-dispatch-state-make)
                (:copier nil))
-  "Active dispatch session state."
-  dispatcher-buffer tasks statuses agents turn-complete-subscription)
+  "Active dispatch session state.
+SUBSCRIPTIONS is the list of agent-shell event subscription tokens to drop
+on teardown.  SUBAGENTS maps a tracked Agent tool call ID to a plist
+\(:task-id ID :background BOOL)."
+  dispatcher-buffer tasks statuses agents subscriptions subagents)
 
 (cl-defstruct (agent-shell-dispatch-agent-info
                (:constructor agent-shell-dispatch-agent-info-make)
@@ -61,9 +64,9 @@
 
 (defun agent-shell-dispatch--clear-state ()
   "Clear dispatch state and unsubscribe from events. Used as teardown hook."
-  (when-let* ((state agent-shell-dispatch--state)
-              (token (agent-shell-dispatch-state-turn-complete-subscription state)))
-    (ignore-errors (agent-shell-unsubscribe :subscription token)))
+  (when-let* ((state agent-shell-dispatch--state))
+    (dolist (token (agent-shell-dispatch-state-subscriptions state))
+      (ignore-errors (agent-shell-unsubscribe :subscription token))))
   (setq agent-shell-dispatch--state nil))
 
 ;; ── Status resolution ─────────────────────────────────────────────────
