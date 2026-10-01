@@ -177,8 +177,8 @@ Derived at runtime via `agent-shell-dispatch-render--derived-layout':
   '("◐" "◓" "◑" "◒")
   "Quarter-circle spinner animation frames.")
 
-(defvar agent-shell-dispatch-render--spinner-index 0
-  "Current spinner frame index.")
+(defconst agent-shell-dispatch-render--spinner-fps 10
+  "Spinner frames per second, matching the heartbeat interval.")
 
 ;; ── Theme ───────────────────────────────────────────────────────────
 
@@ -1042,9 +1042,10 @@ DISPATCHER-BUF is the buffer name."
   svg-str)
 
 (defun agent-shell-dispatch-render-cycle-spinner ()
-  "Advance the spinner frame and update working/claimed icons."
-  (cl-incf agent-shell-dispatch-render--spinner-index)
-  (let ((frame (nth (% agent-shell-dispatch-render--spinner-index
+  "Set the working/claimed icons to the spinner frame for the current time.
+The frame follows the clock rather than a call count, so graphs in
+several shells all spin at the same rate."
+  (let ((frame (nth (% (floor (* (float-time) agent-shell-dispatch-render--spinner-fps))
                        (length agent-shell-dispatch-render--spinner-frames))
                     agent-shell-dispatch-render--spinner-frames))
         (theme (agent-shell-dispatch-render-theme-status
@@ -1088,6 +1089,13 @@ Called by the heartbeat timer.")
   "Function of no args returning non-nil when the host buffer is busy.
 When busy, the heartbeat skips since the host drives updates itself.")
 
+(defvar-local agent-shell-dispatch-render-dismiss-function nil
+  "Function of no args that dismisses this buffer's graph.
+When non-nil, the graph shows a close button that calls it when clicked.")
+
+(defvar-local agent-shell-dispatch-render--dismiss-button nil
+  "Close button bounds (X Y W H) in header SVG pixels, or nil if none is drawn.")
+
 (defvar agent-shell-dispatch-render-advice-target nil
   "Function symbol to advise with the header extend function.
 Global — only one advice installation is needed.")
@@ -1110,8 +1118,69 @@ Global — only one advice installation is needed.")
           (when agent-shell-dispatch-render-header-function
             (ignore-errors (funcall agent-shell-dispatch-render-header-function))))))))
 
+(defconst agent-shell-dispatch-render--dismiss-button-size 14
+  "Side length in pixels of the graph's close button.")
+
+(defvar agent-shell-dispatch-render--header-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [header-line mouse-1] #'agent-shell-dispatch-render-header-click)
+    (define-key map [header-line down-mouse-1] #'ignore)
+    map)
+  "Keymap for the header image, routing clicks to the close button.")
+
+(defun agent-shell-dispatch-render--add-dismiss-button (svg-str x y)
+  "Return SVG-STR with a close button whose top-left corner is at X, Y.
+Records the button bounds for `agent-shell-dispatch-render-header-click'."
+  (let* ((size agent-shell-dispatch-render--dismiss-button-size)
+         (theme (agent-shell-dispatch-render--theme-colors))
+         (r (/ size 2.0))
+         (cx (+ x r))
+         (cy (+ y r))
+         (arm (* r 0.45)))
+    (setq agent-shell-dispatch-render--dismiss-button (list x y size size))
+    (replace-regexp-in-string
+     "</svg>\\'"
+     (format (concat "<rect id=\"agent-shell-dispatch-dismiss\" x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" fill=\"none\"/>"
+                     "<circle cx=\"%.1f\" cy=\"%.1f\" r=\"%.1f\" fill=\"none\" stroke=\"%s\"/>"
+                     "<path d=\"M%.1f %.1fL%.1f %.1fM%.1f %.1fL%.1f %.1f\" stroke=\"%s\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>"
+                     "</svg>")
+             x y size size
+             cx cy (- r 0.5) (agent-shell-dispatch-render-theme-dim theme)
+             (- cx arm) (- cy arm) (+ cx arm) (+ cy arm)
+             (- cx arm) (+ cy arm) (+ cx arm) (- cy arm)
+             (agent-shell-dispatch-render-theme-fg theme))
+     svg-str t t)))
+
+(defun agent-shell-dispatch-render--dismiss-button-hit-p (posn)
+  "Return non-nil when POSN, a header image position, is on the close button.
+Scales from displayed image pixels back to SVG pixels."
+  (when-let* ((button agent-shell-dispatch-render--dismiss-button)
+              (click (posn-object-x-y posn))
+              (shown (posn-object-width-height posn))
+              ((> (car shown) 0))
+              ((stringp header-line-format))
+              (data (plist-get (cdr (get-text-property 1 'display header-line-format)) :data))
+              (dims (agent-shell-dispatch-render--svg-dimensions data)))
+    (let ((x (* (car click) (/ (float (agent-shell-dispatch-render-dimensions-w dims)) (car shown))))
+          (y (* (cdr click) (/ (float (agent-shell-dispatch-render-dimensions-h dims)) (cdr shown)))))
+      (pcase-let ((`(,bx ,by ,bw ,bh) button))
+        (and (<= bx x (+ bx bw)) (<= by y (+ by bh)))))))
+
+(defun agent-shell-dispatch-render-header-click (event)
+  "Dismiss the clicked buffer's graph when EVENT lands on its close button."
+  (interactive "e")
+  (let* ((posn (event-start event))
+         (win (posn-window posn)))
+    (when (window-live-p win)
+      (with-current-buffer (window-buffer win)
+        (when (and agent-shell-dispatch-render-dismiss-function
+                   (agent-shell-dispatch-render--dismiss-button-hit-p posn))
+          (funcall agent-shell-dispatch-render-dismiss-function))))))
+
 (defun agent-shell-dispatch-render--extend-header (&rest _)
   "Build task graph SVG and append below the host header SVG.
+Draws a close button at the graph's top right when
+`agent-shell-dispatch-render-dismiss-function' is set.
 Buffer-local render vars ensure this is a no-op in non-dispatcher buffers."
   (when-let* ((ctx agent-shell-dispatch-render--ctx)
               (status-fn agent-shell-dispatch-render-status-function)
@@ -1125,12 +1194,27 @@ Buffer-local render vars ensure this is a no-op in non-dispatcher buffers."
            (svg (agent-shell-dispatch-render-draw ctx status-map agents))
            (graph-svg (with-temp-buffer (svg-print svg) (buffer-string)))
            (graph-svg (agent-shell-dispatch-render-apply-viewport graph-svg ctx status-map (buffer-name)))
-           (combined (agent-shell-dispatch-render-combine-svgs orig-svg graph-svg -12 10)))
+           (gap-above -12)
+           (combined (agent-shell-dispatch-render-combine-svgs orig-svg graph-svg gap-above 10)))
+      (setq agent-shell-dispatch-render--dismiss-button nil)
       (when combined
+        (when agent-shell-dispatch-render-dismiss-function
+          (setq combined
+                (agent-shell-dispatch-render--add-dismiss-button
+                 combined
+                 (- (agent-shell-dispatch-render-dimensions-w
+                     (agent-shell-dispatch-render--svg-dimensions combined))
+                    agent-shell-dispatch-render--dismiss-button-size 6)
+                 (+ (agent-shell-dispatch-render-dimensions-h
+                     (agent-shell-dispatch-render--svg-dimensions orig-svg))
+                    gap-above 4))))
         (setq header-line-format
               (format " %s" (propertize " " 'display
                                         (list 'image :type 'svg
-                                              :data combined :scale 'default))))))))
+                                              :data combined :scale 'default)
+                                        'keymap agent-shell-dispatch-render--header-map
+                                        'help-echo (when agent-shell-dispatch-render-dismiss-function
+                                                     "mouse-1 on \u00d7: dismiss the task graph"))))))))
 
 (defun agent-shell-dispatch-render--on-theme-change (&rest _)
   "Recompute theme and re-prepare geometry on theme change.
@@ -1169,7 +1253,9 @@ Requires `agent-shell-dispatch-render-global-mode' for the advice."
   "Hook run during teardown for clearing external state.")
 
 (defun agent-shell-dispatch-render-teardown ()
-  "Disable rendering and clear all render state and hooks."
+  "Disable rendering and clear the current buffer's render state and hooks.
+The global `agent-shell-dispatch-render-advice-target' is left alone, since
+other buffers may still be rendering."
   (when agent-shell-dispatch-render-mode
     (agent-shell-dispatch-render-mode 'toggle))
   (run-hooks 'agent-shell-dispatch-render-teardown-hook)
@@ -1181,7 +1267,8 @@ Requires `agent-shell-dispatch-render-global-mode' for the advice."
         agent-shell-dispatch-render-header-function nil
         agent-shell-dispatch-render-reset-function nil
         agent-shell-dispatch-render-busy-p-function nil
-        agent-shell-dispatch-render-advice-target nil
+        agent-shell-dispatch-render-dismiss-function nil
+        agent-shell-dispatch-render--dismiss-button nil
         agent-shell-dispatch-render-teardown-hook nil))
 
 (provide 'agent-shell-dispatch-render)

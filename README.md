@@ -10,6 +10,9 @@ Multi-agent dispatch and coordination for [agent-shell](https://github.com/xenod
 - **Explicit status model** -- tasks are `not-started`, `working`, `done`, `error`, `permission`, or `dead`, driven entirely by explicit reports (no process-state guessing)
 - **Parallel agent spawning** -- launch background agent-shell sessions that work independently
 - **Subagent tracking** -- Claude Code subagents (the Agent tool) launched by the dispatcher appear as graph nodes automatically, with live status and no report calls
+- **Automatic graphs** -- a shell's first Claude Code subagent starts its task graph without any dispatch call
+- **One graph per shell** -- each agent-shell buffer has its own graph and state, so several shells can show graphs at once
+- **Click to dismiss** -- a graph stays up until you click the × at its top right; dismissing a wayfinder graph also unloads its effort
 - **Permission forwarding** -- tool permission requests from background agents show as a lock icon in the SVG header; the native permission UI appears in the subagent's own buffer by default (optionally rendered in the dispatcher via `agent-shell-dispatch-msg-show-permissions-in-dispatcher`)
 - **Inter-agent messaging** -- typed message protocol for progress reports, error reports, input requests, and completion notifications
 - **Dispatcher pattern** -- the primary agent coordinates without implementing; subagents communicate via messages only, and the dispatcher owns all task graph updates
@@ -140,7 +143,9 @@ While a graph is active, every Agent tool call in the dispatcher buffer becomes 
 
 Background subagents (`run_in_background`) are tracked until they finish. claude-agent-acp completes their tool call as soon as they launch, but it holds the dispatcher's turn open until they drain. The node therefore stays `working` until the dispatcher's turn completes, then becomes `done`. The one limitation is that a background subagent which fails after launching still shows as `done`, because no failure status reaches Emacs.
 
-Set `agent-shell-dispatch-track-subagents` to `nil` to turn tracking off. The setting takes effect at the next `agent-shell-dispatch-start`.
+Set `agent-shell-dispatch-track-subagents` to `nil` to turn tracking off. The setting takes effect immediately.
+
+With `agent-shell-dispatch-auto-graph` (the default), you don't need to start a graph first. When a shell launches its first subagent, the shell starts its own graph with that subagent as the first node. The graph stays up after the subagents finish, until you click the × at its top right. Dismissing it removes the graph and its state, but agents spawned from it keep running. The next subagent starts a fresh graph. Spawned sessions never start graphs of their own.
 
 ### 4. (Optional) Wayfinder integration
 
@@ -227,6 +232,7 @@ All dispatch and render state is buffer-local, so multiple independent dispatch 
 | `agent-shell-dispatch-start` | Register tasks and start the SVG task graph |
 | `agent-shell-dispatch-start-current` | Start the SVG task graph in the current request's agent-shell buffer |
 | `agent-shell-dispatch-stop` | Stop rendering (state preserved for toggle) |
+| `agent-shell-dispatch-dismiss` | Remove the current shell's graph and state (what the × button calls); runs `agent-shell-dispatch-dismiss-hook` first |
 | `agent-shell-dispatch-report` | Report task status (`working`, `done`, `error`) -- dispatcher only |
 | `agent-shell-dispatch-current-agent-buffer` | Resolve the agent-shell buffer associated with an MCP/eval request |
 | `agent-shell-dispatch-current-agent-buffer-name` | Like above, but returns the buffer name string |
@@ -266,6 +272,7 @@ All dispatch and render state is buffer-local, so multiple independent dispatch 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `agent-shell-dispatch-track-subagents` | `t` | Show the dispatcher's Claude Code subagents (Agent tool calls) as graph nodes |
+| `agent-shell-dispatch-auto-graph` | `t` | Start a shell's graph on its first Claude Code subagent |
 | `agent-shell-dispatch-wayfinder-auto-start` | `t` | Automatically start tickets whose blockers are all done |
 | `agent-shell-dispatch-wayfinder-poll-interval` | `5.0` | Seconds between GitHub backend poll refreshes |
 | `agent-shell-dispatch-msg-show-permissions-in-dispatcher` | `nil` | Render permission fragments in the dispatcher buffer (SVG lock icon always shows regardless) |

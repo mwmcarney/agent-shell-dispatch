@@ -1020,27 +1020,25 @@ caller's directory over the selected window's shell and spawned agents."
     (should (eq 'error (agent-shell-dispatch-test--status "toolu_bg")))
     (agent-shell-dispatch-stop)))
 
-(ert-deftest subagent-teardown-unsubscribes ()
-  "Render teardown removes the tool-call subscription."
+(ert-deftest subagent-teardown-clears-graph-state ()
+  "Render teardown drops the graph state and its turn-complete subscription."
   (with-dispatch-buffer
     (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
-    (should (agent-shell-dispatch-test--subscribed-p (current-buffer) 'tool-call-update))
     (agent-shell-dispatch-render-teardown)
-    (should-not (agent-shell-dispatch-test--subscribed-p (current-buffer) 'tool-call-update))
     (should-not (agent-shell-dispatch-test--subscribed-p (current-buffer) 'turn-complete))
-    (should-not agent-shell-dispatch--state)
-    ;; Late events after teardown are harmless no-ops
-    (agent-shell-dispatch-test--emit-agent-call "toolu_late")))
+    (should-not agent-shell-dispatch--state)))
 
 (ert-deftest subagent-tracking-disabled-by-defcustom ()
-  "With tracking off, no tool-call subscription is made and no nodes appear."
+  "With tracking off, subagents neither add nodes nor start a graph."
   (with-dispatch-buffer
     (let ((agent-shell-dispatch-track-subagents nil))
       (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
-      (should-not (agent-shell-dispatch-test--subscribed-p (current-buffer) 'tool-call-update))
       (agent-shell-dispatch-test--emit-agent-call "toolu_1")
-      (should-not (agent-shell-dispatch-test--task "toolu_1")))
-    (agent-shell-dispatch-stop)))
+      (should-not (agent-shell-dispatch-test--task "toolu_1"))
+      (agent-shell-dispatch-stop)
+      (agent-shell-dispatch--clear-state)
+      (agent-shell-dispatch-test--emit-agent-call "toolu_2")
+      (should-not agent-shell-dispatch--state))))
 
 (ert-deftest subagent-finished-foreground-calls-stop-being-tracked ()
   "Foreground subagents leave the tracking table once they finish; running
@@ -1078,6 +1076,277 @@ background subagents stay tracked until the turn completes."
                  '(:id "7" :name "probe api") 'github nil nil)))
     (should (string-match-p "Work on: probe api" prompt))
     (should (string-match-p "gh issue close 7" prompt))))
+
+;; ── One graph per shell ────────────────────────────────────────────────
+
+(defun agent-shell-dispatch-test--set-host-header ()
+  "Give the current buffer an agent-shell style header holding an SVG image."
+  (setq-local header-line-format
+              (concat " " (propertize " " 'display
+                                      (list 'image :type 'svg
+                                            :data "<svg width=\"100\" height=\"20\"></svg>")))))
+
+(defun agent-shell-dispatch-test--header-svg ()
+  "Return the SVG data shown in the current buffer's header line."
+  (plist-get (cdr (get-text-property 1 'display header-line-format)) :data))
+
+(ert-deftest dispatch-start-from-another-buffer-targets-dispatcher ()
+  "The graph starts in the named dispatcher, whatever buffer is current."
+  (with-dispatch-buffer
+    (let ((dispatcher (buffer-name)))
+      (with-temp-buffer
+        (agent-shell-dispatch-start dispatcher (test-tasks-simple))
+        (should-not agent-shell-dispatch--state))
+      (should agent-shell-dispatch--state)
+      (should agent-shell-dispatch-render--ctx)
+      (should agent-shell-dispatch-render-mode)
+      (agent-shell-dispatch-stop))))
+
+(ert-deftest dispatch-graphs-are-independent-per-shell ()
+  "Starting and tearing down a graph in one shell leaves another shell's graph working."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+    (agent-shell-dispatch-report "a" "done")
+    (with-dispatch-buffer
+      (agent-shell-dispatch-start (buffer-name) (test-tasks-diamond))
+      (agent-shell-dispatch-render-teardown))
+    (should (eq 'done (agent-shell-dispatch-test--status "a")))
+    (should agent-shell-dispatch-render-mode)
+    (should (eq 'agent-shell--update-header-and-mode-line
+                agent-shell-dispatch-render-advice-target))
+    (agent-shell-dispatch-test--set-host-header)
+    (agent-shell-dispatch-render--extend-header)
+    (should (string-match-p "Task A" (agent-shell-dispatch-test--header-svg)))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest dispatch-start-keeps-other-shells-blocked-agents ()
+  "Restarting a graph forgets only its own agents' pending permission and input."
+  (let ((agent-shell-dispatch-msg--pending-permission-agents nil)
+        (agent-shell-dispatch-msg--pending-input-agents nil))
+    (with-dispatch-buffer
+      (let ((dispatcher (buffer-name)))
+        (agent-shell-dispatch-start dispatcher (test-tasks-simple))
+        (with-dispatch-buffer
+          (setq-local agent-shell-dispatch--primary-buffer dispatcher)
+          (let ((agent (buffer-name)))
+            (setq agent-shell-dispatch-msg--pending-permission-agents (list agent)
+                  agent-shell-dispatch-msg--pending-input-agents (list agent))
+            (with-dispatch-buffer
+              (agent-shell-dispatch-start (buffer-name) (test-tasks-diamond))
+              (agent-shell-dispatch-stop))
+            (should (equal (list agent) agent-shell-dispatch-msg--pending-permission-agents))
+            (should (equal (list agent) agent-shell-dispatch-msg--pending-input-agents))
+            (agent-shell-dispatch-start dispatcher (test-tasks-simple))
+            (should-not agent-shell-dispatch-msg--pending-permission-agents)
+            (should-not agent-shell-dispatch-msg--pending-input-agents)))
+        (agent-shell-dispatch-stop)))))
+
+(ert-deftest render-spinner-frame-follows-the-clock ()
+  "Every graph shows the same spinner frame at a given moment, however many
+graphs render it."
+  (let ((working-icon (lambda ()
+                        (agent-shell-dispatch-render-status-style-icon
+                         (cdr (assq 'working (agent-shell-dispatch-render-theme-status
+                                              (agent-shell-dispatch-render--theme-colors))))))))
+    (cl-letf (((symbol-function 'float-time) (lambda (&optional _) 100.0)))
+      (agent-shell-dispatch-render-cycle-spinner)
+      (let ((frame (funcall working-icon)))
+        (agent-shell-dispatch-render-cycle-spinner)
+        (should (equal frame (funcall working-icon)))
+        (cl-letf (((symbol-function 'float-time) (lambda (&optional _) 100.1)))
+          (agent-shell-dispatch-render-cycle-spinner)
+          (should-not (equal frame (funcall working-icon))))))))
+
+;; ── Automatic subagent graph ──────────────────────────────────────────
+
+(defun agent-shell-dispatch-test--watchers (buffer)
+  "Return the number of tool-call-update subscriptions on BUFFER."
+  (cl-count-if (lambda (sub) (and (eq (nth 1 sub) buffer) (eq (nth 2 sub) 'tool-call-update)))
+               agent-shell-test--subscriptions))
+
+(ert-deftest auto-graph-starts-on-first-subagent ()
+  "A shell's first subagent starts a graph showing it, without any dispatch call."
+  (agent-shell-dispatch-global-mode 1)
+  (with-dispatch-buffer
+    (should-not agent-shell-dispatch--state)
+    (let ((shell-maker-busy-val t))
+      (agent-shell-dispatch-test--emit-agent-call "toolu_1" :description "Research: caching")
+      (should agent-shell-dispatch-render-mode)
+      (should (equal "Research: caching"
+                     (plist-get (agent-shell-dispatch-test--task "toolu_1") :name)))
+      (should (eq 'working (agent-shell-dispatch-test--status "toolu_1"))))
+    (agent-shell-dispatch-test--set-host-header)
+    (agent-shell-dispatch-render--extend-header)
+    (should (string-match-p "caching" (agent-shell-dispatch-test--header-svg)))
+    (agent-shell-dispatch-render-teardown)))
+
+(ert-deftest auto-graph-starts-fresh-after-teardown ()
+  "After a graph is torn down, the next subagent starts a new graph with only itself."
+  (agent-shell-dispatch-global-mode 1)
+  (with-dispatch-buffer
+    (agent-shell-dispatch-test--emit-agent-call "toolu_1")
+    (agent-shell-dispatch-render-teardown)
+    (agent-shell-dispatch-test--emit-agent-call "toolu_2")
+    (should (equal '("toolu_2")
+                   (mapcar (lambda (task) (plist-get task :id))
+                           (agent-shell-dispatch-state-tasks agent-shell-dispatch--state))))
+    (agent-shell-dispatch-render-teardown)))
+
+(ert-deftest auto-graph-ignores-spawned-agents ()
+  "Subagents inside a dispatch-spawned agent do not give it a graph of its own."
+  (agent-shell-dispatch-global-mode 1)
+  (with-dispatch-buffer
+    (setq-local agent-shell-dispatch--primary-buffer "dispatcher")
+    (agent-shell-dispatch-test--emit-agent-call "toolu_1")
+    (should-not agent-shell-dispatch--state)))
+
+(ert-deftest auto-graph-disabled-by-defcustom ()
+  "With auto-graph off, subagents only show in a graph that was started explicitly."
+  (agent-shell-dispatch-global-mode 1)
+  (with-dispatch-buffer
+    (let ((agent-shell-dispatch-auto-graph nil))
+      (agent-shell-dispatch-test--emit-agent-call "toolu_1")
+      (should-not agent-shell-dispatch--state)
+      (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+      (agent-shell-dispatch-test--emit-agent-call "toolu_2")
+      (should (agent-shell-dispatch-test--task "toolu_2")))
+    (agent-shell-dispatch-render-teardown)))
+
+(ert-deftest auto-graph-watches-shells-opened-before-global-mode ()
+  "Enabling the global mode watches shells that are already open."
+  (agent-shell-dispatch-global-mode -1)
+  (with-dispatch-buffer
+    (agent-shell-dispatch-global-mode 1)
+    (agent-shell-dispatch-test--emit-agent-call "toolu_1")
+    (should (agent-shell-dispatch-test--task "toolu_1"))
+    (agent-shell-dispatch-render-teardown)))
+
+(ert-deftest auto-graph-global-mode-off-stops-watching ()
+  "Disabling the global mode stops watching shells for subagents."
+  (agent-shell-dispatch-global-mode 1)
+  (with-dispatch-buffer
+    (agent-shell-dispatch-global-mode -1)
+    (should (= 0 (agent-shell-dispatch-test--watchers (current-buffer))))
+    (agent-shell-dispatch-global-mode 1)))
+
+(ert-deftest auto-graph-one-watcher-per-shell ()
+  "Restarting a shell's graph does not add more tool-call subscriptions."
+  (agent-shell-dispatch-global-mode 1)
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+    (agent-shell-dispatch-start (buffer-name) (test-tasks-diamond))
+    (should (= 1 (agent-shell-dispatch-test--watchers (current-buffer))))
+    (agent-shell-dispatch-render-teardown)))
+
+;; ── Dismissing a graph from its header ────────────────────────────────
+
+(defun agent-shell-dispatch-test--dismiss-button-center ()
+  "Return the (X . Y) centre of the close button in the header SVG, or nil."
+  (let ((svg (agent-shell-dispatch-test--header-svg)))
+    (when (string-match (concat "<rect id=\"agent-shell-dispatch-dismiss\" "
+                                "x=\"\\([0-9.]+\\)\" y=\"\\([0-9.]+\\)\" "
+                                "width=\"\\([0-9.]+\\)\" height=\"\\([0-9.]+\\)\"")
+                        svg)
+      (let ((x (string-to-number (match-string 1 svg)))
+            (y (string-to-number (match-string 2 svg)))
+            (w (string-to-number (match-string 3 svg)))
+            (h (string-to-number (match-string 4 svg))))
+        (cons (+ x (/ w 2.0)) (+ y (/ h 2.0)))))))
+
+(defun agent-shell-dispatch-test--header-dims ()
+  "Return the (WIDTH . HEIGHT) of the header SVG."
+  (let ((dims (agent-shell-dispatch-render--svg-dimensions
+               (agent-shell-dispatch-test--header-svg))))
+    (cons (agent-shell-dispatch-render-dimensions-w dims)
+          (agent-shell-dispatch-render-dimensions-h dims))))
+
+(defun agent-shell-dispatch-test--click-header (x y &optional scale)
+  "Click the current buffer's header image at image pixel X, Y.
+SCALE is how much larger the image is displayed than its SVG size."
+  (let* ((scale (or scale 1))
+         (dims (agent-shell-dispatch-test--header-dims))
+         (win (selected-window)))
+    (set-window-buffer win (current-buffer))
+    (agent-shell-dispatch-render-header-click
+     (list 'mouse-1
+           (list win 'header-line '(0 . 0) 0 nil nil '(0 . 0) nil
+                 (cons (round (* x scale)) (round (* y scale)))
+                 (cons (round (* (car dims) scale)) (round (* (cdr dims) scale))))))))
+
+(defun agent-shell-dispatch-test--render-graph ()
+  "Start a graph in the current shell and draw it into a host header."
+  (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+  (agent-shell-dispatch-test--set-host-header)
+  (agent-shell-dispatch-render--extend-header))
+
+(ert-deftest dismiss-clicking-close-button-removes-graph ()
+  "Clicking the graph's close button removes the graph and its state."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-test--render-graph)
+    (let ((center (agent-shell-dispatch-test--dismiss-button-center)))
+      (should center)
+      (agent-shell-dispatch-test--click-header (car center) (cdr center)))
+    (should-not agent-shell-dispatch--state)
+    (should-not agent-shell-dispatch-render-mode)
+    (should-not agent-shell-dispatch-render--ctx)))
+
+(ert-deftest dismiss-clicking-elsewhere-keeps-graph ()
+  "Clicking the header away from the close button leaves the graph."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-test--render-graph)
+    (agent-shell-dispatch-test--click-header 1 1)
+    (should agent-shell-dispatch--state)
+    (should agent-shell-dispatch-render-mode)
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest dismiss-click-accounts-for-image-scaling ()
+  "The close button is hit where it is displayed when the header image is scaled."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-test--render-graph)
+    (let ((center (agent-shell-dispatch-test--dismiss-button-center)))
+      (agent-shell-dispatch-test--click-header (car center) (cdr center) 2))
+    (should-not agent-shell-dispatch--state)))
+
+(ert-deftest dismiss-button-only-drawn-when-graph-can-be-dismissed ()
+  "A renderer host that provides no dismiss function gets no close button."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-test--render-graph)
+    (setq agent-shell-dispatch-render-dismiss-function nil)
+    (agent-shell-dispatch-test--set-host-header)
+    (agent-shell-dispatch-render--extend-header)
+    (should-not (agent-shell-dispatch-test--dismiss-button-center))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest dismiss-runs-dismiss-hook ()
+  "Dismissing a graph runs the shell's dismiss hook so extensions can clean up."
+  (with-dispatch-buffer
+    (let ((ran nil))
+      (agent-shell-dispatch-start (buffer-name) (test-tasks-simple))
+      (add-hook 'agent-shell-dispatch-dismiss-hook (lambda () (setq ran t)) nil t)
+      (agent-shell-dispatch-dismiss)
+      (should ran)
+      (should-not agent-shell-dispatch--state))))
+
+(ert-deftest dismiss-wayfinder-graph-unloads-effort ()
+  "Dismissing a wayfinder graph unloads its effort and stops watching tickets."
+  (let* ((root (file-name-as-directory (make-temp-file "wayfinder-dismiss-" t)))
+         (issues (expand-file-name ".scratch/demo/issues" root)))
+    (unwind-protect
+        (with-dispatch-buffer
+          (make-directory issues t)
+          (with-temp-file (expand-file-name "01-first.md" issues)
+            (insert "Type: task\nStatus: claimed\nBlocked by:\n\n# First\n"))
+          (let ((default-directory root))
+            (agent-shell-dispatch-wayfinder-load "demo"))
+          (should agent-shell-dispatch-wayfinder--effort)
+          (agent-shell-dispatch-dismiss)
+          (should-not agent-shell-dispatch-wayfinder--effort)
+          (should-not agent-shell-dispatch-wayfinder--file-watcher)
+          (should-not agent-shell-dispatch--state)
+          ;; A later graph in the same shell is not wayfinder's to unload
+          (should-not (memq #'agent-shell-dispatch-wayfinder-unload
+                            agent-shell-dispatch-dismiss-hook)))
+      (delete-directory root t))))
 
 (provide 'agent-shell-dispatch-integration-test)
 ;;; agent-shell-dispatch-integration-test.el ends here

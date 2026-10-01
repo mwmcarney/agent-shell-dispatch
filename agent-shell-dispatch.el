@@ -43,8 +43,15 @@
 
 (defcustom agent-shell-dispatch-track-subagents t
   "When non-nil, show the dispatcher's Claude Code subagents in the task graph.
-Each Agent tool call becomes a node whose status follows the tool call.
-Takes effect the next time `agent-shell-dispatch-start' runs."
+Each Agent tool call becomes a node whose status follows the tool call."
+  :type 'boolean
+  :group 'agent-shell-dispatch)
+
+(defcustom agent-shell-dispatch-auto-graph t
+  "When non-nil, a shell's first Claude Code subagent starts its task graph.
+Without it, subagents only appear in a graph started explicitly, e.g. by
+`agent-shell-dispatch-start' or a wayfinder effort.  Needs
+`agent-shell-dispatch-global-mode' and `agent-shell-dispatch-track-subagents'."
   :type 'boolean
   :group 'agent-shell-dispatch)
 
@@ -286,57 +293,74 @@ Translates internal agent-info to the renderer's protocol type."
                agents)
       result)))
 
+(defun agent-shell-dispatch--forget-blocked-agents (dispatcher-buffer)
+  "Drop DISPATCHER-BUFFER's agents from the pending permission and input lists.
+Agents of other dispatchers keep their entries, so restarting one graph
+does not hide another graph's blocked agents."
+  (let ((foreign-p (lambda (agent-buf)
+                     (when-let* ((buf (get-buffer agent-buf)))
+                       (not (equal dispatcher-buffer
+                                   (buffer-local-value 'agent-shell-dispatch--primary-buffer
+                                                       buf)))))))
+    (setq agent-shell-dispatch-msg--pending-permission-agents
+          (seq-filter foreign-p agent-shell-dispatch-msg--pending-permission-agents)
+          agent-shell-dispatch-msg--pending-input-agents
+          (seq-filter foreign-p agent-shell-dispatch-msg--pending-input-agents))))
+
 (defun agent-shell-dispatch-start (dispatcher-buffer tasks &optional _interval)
   "Start the dispatch task graph in the `agent-shell' header.
 DISPATCHER-BUFFER is the dispatcher's `agent-shell' buffer name.
-TASKS is a list of plists: ((:id ID :name NAME :agent AGENT-BUF) ...)."
-  (agent-shell-dispatch-render-teardown)
-  (setq agent-shell-dispatch-msg--pending-permission-agents nil
-        agent-shell-dispatch-msg--pending-input-agents nil)
-  ;; Normalize :agent — default to dispatcher buffer if missing or not a string
-  (let* ((normalized (mapcar (lambda (task)
-                               (let ((agent (plist-get task :agent)))
-                                 (if (stringp agent) task
-                                   (plist-put (copy-sequence task) :agent dispatcher-buffer))))
-                             tasks))
-         (task-defs (mapcar (lambda (task)
-                              (agent-shell-dispatch-render-task-make
-                               :id (plist-get task :id)
-                               :name (plist-get task :name)
-                               :depends-on (plist-get task :depends-on)))
-                            normalized)))
-    (setq agent-shell-dispatch--state
-          (agent-shell-dispatch-state-make
-           :dispatcher-buffer dispatcher-buffer
-           :tasks normalized
-           :statuses (make-hash-table :test 'equal)
-           :agents (make-hash-table :test 'equal)
-           :subagents (make-hash-table :test 'equal)
-           :subscriptions
-           (agent-shell-dispatch--subscribe (get-buffer dispatcher-buffer))))
-    ;; Auto-enable global mode if not already on
-    (unless agent-shell-dispatch-global-mode
-      (agent-shell-dispatch-global-mode 1))
-    ;; Set up render module
-    (add-hook 'agent-shell-dispatch-render-teardown-hook
-              #'agent-shell-dispatch--clear-state)
-    (agent-shell-dispatch-render-set-tasks task-defs)
-    (setq agent-shell-dispatch-render-buffer dispatcher-buffer
-          agent-shell-dispatch-render-status-function #'agent-shell-dispatch--build-status-map
-          agent-shell-dispatch-render-agent-activity-function #'agent-shell-dispatch--render-agents
-          agent-shell-dispatch-render-header-function #'agent-shell--update-header-and-mode-line
-          agent-shell-dispatch-render-reset-function (lambda ()
-                                                       (when (boundp 'agent-shell--header-cache)
-                                                         (setq agent-shell--header-cache nil))
-                                                       (agent-shell--update-header-and-mode-line))
-          agent-shell-dispatch-render-busy-p-function #'shell-maker-busy
-          agent-shell-dispatch-render-advice-target 'agent-shell--update-header-and-mode-line)
-    ;; Ensure render advice is installed — the global mode body may have run
-    ;; before the advice target was set (e.g. at package load time).
-    (advice-add 'agent-shell--update-header-and-mode-line
-                :after #'agent-shell-dispatch-render--extend-header)
-    ;; Enable render mode in dispatcher buffer
-    (with-current-buffer (get-buffer dispatcher-buffer)
+TASKS is a list of plists: ((:id ID :name NAME :agent AGENT-BUF) ...).
+The graph and its state belong to DISPATCHER-BUFFER, so each shell can
+show its own graph."
+  (with-current-buffer (get-buffer dispatcher-buffer)
+    (agent-shell-dispatch-render-teardown)
+    ;; A new graph starts with no dismiss handlers from the previous one
+    (kill-local-variable 'agent-shell-dispatch-dismiss-hook)
+    (agent-shell-dispatch--forget-blocked-agents dispatcher-buffer)
+    ;; Normalize :agent — default to dispatcher buffer if missing or not a string
+    (let* ((normalized (mapcar (lambda (task)
+                                 (let ((agent (plist-get task :agent)))
+                                   (if (stringp agent) task
+                                     (plist-put (copy-sequence task) :agent dispatcher-buffer))))
+                               tasks))
+           (task-defs (mapcar (lambda (task)
+                                (agent-shell-dispatch-render-task-make
+                                 :id (plist-get task :id)
+                                 :name (plist-get task :name)
+                                 :depends-on (plist-get task :depends-on)))
+                              normalized)))
+      (setq agent-shell-dispatch--state
+            (agent-shell-dispatch-state-make
+             :dispatcher-buffer dispatcher-buffer
+             :tasks normalized
+             :statuses (make-hash-table :test 'equal)
+             :agents (make-hash-table :test 'equal)
+             :subagents (make-hash-table :test 'equal)
+             :subscriptions (agent-shell-dispatch--subscribe (current-buffer))))
+      (agent-shell-dispatch--watch-subagents)
+      ;; Auto-enable global mode if not already on
+      (unless agent-shell-dispatch-global-mode
+        (agent-shell-dispatch-global-mode 1))
+      ;; Set up render module
+      (add-hook 'agent-shell-dispatch-render-teardown-hook
+                #'agent-shell-dispatch--clear-state)
+      (agent-shell-dispatch-render-set-tasks task-defs)
+      (setq agent-shell-dispatch-render-buffer dispatcher-buffer
+            agent-shell-dispatch-render-status-function #'agent-shell-dispatch--build-status-map
+            agent-shell-dispatch-render-agent-activity-function #'agent-shell-dispatch--render-agents
+            agent-shell-dispatch-render-header-function #'agent-shell--update-header-and-mode-line
+            agent-shell-dispatch-render-reset-function (lambda ()
+                                                         (when (boundp 'agent-shell--header-cache)
+                                                           (setq agent-shell--header-cache nil))
+                                                         (agent-shell--update-header-and-mode-line))
+            agent-shell-dispatch-render-busy-p-function #'shell-maker-busy
+            agent-shell-dispatch-render-dismiss-function #'agent-shell-dispatch-dismiss
+            agent-shell-dispatch-render-advice-target 'agent-shell--update-header-and-mode-line)
+      ;; Ensure render advice is installed — the global mode body may have run
+      ;; before the advice target was set (e.g. at package load time).
+      (advice-add 'agent-shell--update-header-and-mode-line
+                  :after #'agent-shell-dispatch-render--extend-header)
       (unless agent-shell-dispatch-render-mode
         (agent-shell-dispatch-render-mode 'toggle)))))
 
@@ -469,6 +493,12 @@ stays working until the dispatcher's turn completes."
     ("completed" (if background "working" "done"))
     (_ "working")))
 
+(defun agent-shell-dispatch--subagent-task (tool-call-id tool-call)
+  "Return the graph task for the subagent in TOOL-CALL, keyed by TOOL-CALL-ID."
+  (list :id tool-call-id
+        :name (or (map-elt (map-elt tool-call :raw-input) 'description)
+                  (map-elt tool-call :title))))
+
 (defun agent-shell-dispatch--track-subagent (tool-call-id tool-call)
   "Return the tracking plist for TOOL-CALL-ID, registering it on first sight.
 A subagent that references a ticket already in the graph reports to that
@@ -477,28 +507,40 @@ ticket.  Otherwise TOOL-CALL is added as a new task keyed by TOOL-CALL-ID."
          (subagents (agent-shell-dispatch-state-subagents state)))
     (or (gethash tool-call-id subagents)
         (let* ((raw (map-elt tool-call :raw-input))
-               (description (map-elt raw 'description))
                (ticket (agent-shell-dispatch--referenced-ticket
-                        (list description (map-elt raw 'prompt))
+                        (list (map-elt raw 'description) (map-elt raw 'prompt))
                         (mapcar (lambda (task) (plist-get task :id))
                                 (agent-shell-dispatch-state-tasks state)))))
           (unless ticket
             (agent-shell-dispatch-add-task
-             (list :id tool-call-id
-                   :name (or description (map-elt tool-call :title)))))
+             (agent-shell-dispatch--subagent-task tool-call-id tool-call)))
           (puthash tool-call-id
                    (list :task-id (or ticket tool-call-id)
                          :background (and (map-elt raw 'run_in_background) t))
                    subagents)))))
 
+(defun agent-shell-dispatch--ensure-subagent-graph (tool-call-id tool-call)
+  "Return the current shell's dispatch state, auto-starting a graph if allowed.
+An auto-started graph begins with the subagent in TOOL-CALL (keyed by
+TOOL-CALL-ID).  Shells spawned by dispatch never get a graph of their own."
+  (or agent-shell-dispatch--state
+      (when (and agent-shell-dispatch-auto-graph
+                 (null agent-shell-dispatch--primary-buffer))
+        (agent-shell-dispatch-start
+         (buffer-name) (list (agent-shell-dispatch--subagent-task tool-call-id tool-call)))
+        agent-shell-dispatch--state)))
+
 (defun agent-shell-dispatch--on-tool-call-update (event)
   "Reflect an Agent tool call in EVENT as a dispatch task status.
-A subagent stops being tracked once it reaches a final status."
-  (when-let* ((agent-shell-dispatch--state)
+The first subagent in a shell without a graph may start one; see
+`agent-shell-dispatch-auto-graph'.  A subagent stops being tracked once it
+reaches a final status."
+  (when-let* ((agent-shell-dispatch-track-subagents)
               (data (map-elt event :data))
               (tool-call-id (map-elt data :tool-call-id))
               (tool-call (map-elt data :tool-call))
-              ((agent-shell-dispatch--subagent-call-p tool-call)))
+              ((agent-shell-dispatch--subagent-call-p tool-call))
+              ((agent-shell-dispatch--ensure-subagent-graph tool-call-id tool-call)))
     (let* ((info (agent-shell-dispatch--track-subagent tool-call-id tool-call))
            (status (agent-shell-dispatch--subagent-status
                     (map-elt tool-call :status) (plist-get info :background))))
@@ -527,18 +569,47 @@ signal.  Settled subagents stop being tracked."
                subagents))))
 
 (defun agent-shell-dispatch--subscribe (dispatcher-buffer)
-  "Subscribe to DISPATCHER-BUFFER events and return the subscription tokens."
-  (cons (agent-shell-subscribe-to
+  "Subscribe to DISPATCHER-BUFFER's graph events; return the subscription tokens.
+Tool calls are watched separately, for the shell's whole life; see
+`agent-shell-dispatch--watch-subagents'."
+  (list (agent-shell-subscribe-to
          :shell-buffer dispatcher-buffer
          :event 'turn-complete
          :on-event (lambda (_event)
                      (agent-shell-dispatch--settle-background-subagents)
-                     (agent-shell-dispatch--drain-queue)))
-        (when agent-shell-dispatch-track-subagents
-          (list (agent-shell-subscribe-to
-                 :shell-buffer dispatcher-buffer
-                 :event 'tool-call-update
-                 :on-event #'agent-shell-dispatch--on-tool-call-update)))))
+                     (agent-shell-dispatch--drain-queue)))))
+
+(defvar-local agent-shell-dispatch--subagent-watch nil
+  "Subscription token for this shell's `tool-call-update' watcher.")
+
+(defun agent-shell-dispatch--watch-subagents ()
+  "Watch the current shell's tool calls for Claude Code subagents.
+The watcher outlives any one graph, so a dismissed graph can be followed
+by a new one.  Idempotent."
+  (unless agent-shell-dispatch--subagent-watch
+    (setq agent-shell-dispatch--subagent-watch
+          (agent-shell-subscribe-to
+           :shell-buffer (current-buffer)
+           :event 'tool-call-update
+           :on-event #'agent-shell-dispatch--on-tool-call-update))))
+
+(defun agent-shell-dispatch--unwatch-subagents ()
+  "Stop watching the current shell's tool calls."
+  (when agent-shell-dispatch--subagent-watch
+    (ignore-errors (agent-shell-unsubscribe :subscription agent-shell-dispatch--subagent-watch))
+    (setq agent-shell-dispatch--subagent-watch nil)))
+
+(defvar agent-shell-dispatch-dismiss-hook nil
+  "Hook run in a shell when its graph is dismissed, before the graph is removed.
+Extensions that own a graph add to it buffer-locally to clean up after
+themselves; `agent-shell-dispatch-start' clears it for each new graph.")
+
+(defun agent-shell-dispatch-dismiss ()
+  "Dismiss the current shell's task graph and forget its dispatch state.
+Runs `agent-shell-dispatch-dismiss-hook' first.  Spawned agents keep running.
+Called by the graph's close button."
+  (run-hooks 'agent-shell-dispatch-dismiss-hook)
+  (agent-shell-dispatch-render-teardown))
 
 (defun agent-shell-dispatch-stop ()
   "Stop rendering. State preserved for mode toggle."
@@ -727,7 +798,9 @@ Returns t on success, nil if buffer not found."
   "Global minor mode for agent-shell-dispatch.
 Installs advice for header rendering, queue draining, session mode
 propagation, and a theme change hook.  All are no-ops in buffers
-without active dispatch state (buffer-local).
+without active dispatch state (buffer-local).  Also watches every
+`agent-shell' buffer for Claude Code subagents; see
+`agent-shell-dispatch-auto-graph'.
 Enable in your config: (agent-shell-dispatch-global-mode 1)"
   :group 'agent-shell-dispatch
   (if agent-shell-dispatch-global-mode
@@ -740,7 +813,10 @@ Enable in your config: (agent-shell-dispatch-global-mode 1)"
         (advice-add 'agent-shell-set-session-mode
                     :around #'agent-shell-dispatch--propagate-session-mode)
         (add-hook 'enable-theme-functions
-                  #'agent-shell-dispatch-render--on-theme-change))
+                  #'agent-shell-dispatch-render--on-theme-change)
+        (add-hook 'agent-shell-mode-hook #'agent-shell-dispatch--watch-subagents)
+        (dolist (buf (agent-shell-dispatch--agent-shell-buffers))
+          (with-current-buffer buf (agent-shell-dispatch--watch-subagents))))
     (when agent-shell-dispatch-render-advice-target
       (advice-remove agent-shell-dispatch-render-advice-target
                      #'agent-shell-dispatch-render--extend-header))
@@ -749,7 +825,10 @@ Enable in your config: (agent-shell-dispatch-global-mode 1)"
     (advice-remove 'agent-shell-set-session-mode
                    #'agent-shell-dispatch--propagate-session-mode)
     (remove-hook 'enable-theme-functions
-                 #'agent-shell-dispatch-render--on-theme-change)))
+                 #'agent-shell-dispatch-render--on-theme-change)
+    (remove-hook 'agent-shell-mode-hook #'agent-shell-dispatch--watch-subagents)
+    (dolist (buf (agent-shell-dispatch--agent-shell-buffers))
+      (with-current-buffer buf (agent-shell-dispatch--unwatch-subagents)))))
 
 (provide 'agent-shell-dispatch)
 ;;; agent-shell-dispatch.el ends here

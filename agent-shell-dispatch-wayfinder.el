@@ -30,6 +30,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'filenotify)
 (require 'agent-shell-dispatch)
 
 (defvar-local agent-shell-dispatch-wayfinder--effort nil
@@ -390,6 +391,7 @@ Local backend uses file-notify; github uses a poll timer."
 
 (cl-defun agent-shell-dispatch-wayfinder-load (effort &key backend)
   "Load wayfinder EFFORT and start dispatch with its task graph.
+Dismissing the graph unloads the effort.
 EFFORT is the slug (local) or map title substring (github).
 BACKEND is `local' (default) or `github'."
   (interactive "sEffort slug: ")
@@ -407,7 +409,8 @@ BACKEND is `local' (default) or `github'."
             agent-shell-dispatch-wayfinder--known-ids ids)
       (agent-shell-dispatch-wayfinder--sync-statuses tickets)
       (agent-shell-dispatch-wayfinder--auto-start-ready tickets)
-      (agent-shell-dispatch-wayfinder--start-watching effort be))
+      (agent-shell-dispatch-wayfinder--start-watching effort be)
+      (add-hook 'agent-shell-dispatch-dismiss-hook #'agent-shell-dispatch-wayfinder-unload nil t))
     (message "Wayfinder: loaded %d tickets from %s (%s)" (length tickets) effort be)))
 
 (defun agent-shell-dispatch-wayfinder-refresh ()
@@ -434,6 +437,7 @@ is non-nil, automatically starts unblocked tickets."
   (interactive)
   (when-let* ((buf (agent-shell-dispatch-wayfinder--dispatch-buffer)))
     (with-current-buffer buf
+      (remove-hook 'agent-shell-dispatch-dismiss-hook #'agent-shell-dispatch-wayfinder-unload t)
       (agent-shell-dispatch-wayfinder--stop-watching)
       (agent-shell-dispatch-stop)
       (agent-shell-dispatch--clear-state)
