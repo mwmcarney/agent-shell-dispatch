@@ -454,28 +454,71 @@ preventing tasks from resolving to `dead'."
                  (agent-shell-dispatch-wayfinder--ticket-dispatch-status
                   '(:id "3" :status nil)))))
 
+(defun test-parse-local-ticket (content)
+  "Parse CONTENT as local ticket file 03-do-the-thing.md and return its plist."
+  (let ((dir (make-temp-file "wayfinder-test-" t)))
+    (unwind-protect
+        (let ((file (expand-file-name "03-do-the-thing.md" dir)))
+          (with-temp-file file (insert content))
+          (agent-shell-dispatch-wayfinder--local-parse-ticket file))
+      (delete-directory dir t))))
+
 (ert-deftest wayfinder-local-parse-ticket ()
   "Local backend parses markdown ticket files correctly."
-  (let ((tmp (make-temp-file "wayfinder-test-" nil ".md")))
+  (let ((ticket (test-parse-local-ticket
+                 "Type: grilling\nStatus: claimed\nBlocked by: 1, 2\n\n# Do the thing\n\nBody text.")))
+    (should ticket)
+    (should (equal "3" (plist-get ticket :id)))
+    (should (equal "do the thing" (plist-get ticket :name)))
+    (should (equal "grilling" (plist-get ticket :type)))
+    (should (equal "claimed" (plist-get ticket :status)))
+    (should (equal '("1" "2") (plist-get ticket :blocked-by)))))
+
+(ert-deftest wayfinder-local-parse-blocked-by-prose-means-unblocked ()
+  "A Blocked by line with no ticket numbers yields no dependencies."
+  (should-not (plist-get (test-parse-local-ticket
+                          "Type: task\nBlocked by: None (can start immediately)\n")
+                         :blocked-by)))
+
+(ert-deftest wayfinder-local-parse-blocked-by-ignores-prose-around-ids ()
+  "Ticket numbers are extracted from a Blocked by line mixed with prose."
+  (should (equal '("1" "12")
+                 (plist-get (test-parse-local-ticket
+                             "Type: task\nBlocked by: 01 (audit), 12\n")
+                            :blocked-by))))
+
+(ert-deftest wayfinder-github-parse-blocked-by-prose-means-unblocked ()
+  "A GitHub Blocked by line with no issue numbers yields no dependencies."
+  (should-not (agent-shell-dispatch-wayfinder--github-parse-blocked-by
+               "Blocked by: None (can start immediately)\n"))
+  (should (equal '("4" "7")
+                 (agent-shell-dispatch-wayfinder--github-parse-blocked-by
+                  "Intro\nBlocked by: #4, #7\n"))))
+
+(ert-deftest dispatch-resolve-prefers-dispatcher-in-callers-project ()
+  "Resolution from a non-shell buffer picks the dispatcher rooted in the
+caller's directory over the selected window's shell and spawned agents."
+  (let* ((mine (file-name-as-directory (make-temp-file "proj-mine-" t)))
+         (other (file-name-as-directory (make-temp-file "proj-other-" t)))
+         (make-shell (lambda (name dir &optional primary)
+                       (with-current-buffer (generate-new-buffer name)
+                         (agent-shell-mode)
+                         (setq default-directory dir)
+                         (setq-local agent-shell-dispatch--primary-buffer primary)
+                         (current-buffer))))
+         (dispatcher (funcall make-shell " *shell-mine*" mine))
+         (spawned (funcall make-shell " *agent-mine*" mine " *shell-mine*"))
+         (foreign (funcall make-shell " *shell-other*" other)))
     (unwind-protect
-        (progn
-          (with-temp-file tmp
-            (insert "Type: grilling\nStatus: claimed\nBlocked by: 1, 2\n\n# Do the thing\n\nBody text."))
-          ;; Rename to match expected pattern
-          (let ((proper (expand-file-name "03-do-the-thing.md"
-                                          (file-name-directory tmp))))
-            (rename-file tmp proper t)
-            (unwind-protect
-                (let ((ticket (agent-shell-dispatch-wayfinder--local-parse-ticket proper)))
-                  (should ticket)
-                  (should (equal "3" (plist-get ticket :id)))
-                  (should (equal "do the thing" (plist-get ticket :name)))
-                  (should (equal "grilling" (plist-get ticket :type)))
-                  (should (equal "claimed" (plist-get ticket :status)))
-                  (should (equal '("1" "2") (plist-get ticket :blocked-by))))
-              (delete-file proper))))
-      (when (file-exists-p tmp)
-        (delete-file tmp)))))
+        (save-window-excursion
+          (set-window-buffer (selected-window) foreign)
+          (with-temp-buffer
+            (setq default-directory mine)
+            (should (eq dispatcher
+                        (agent-shell-dispatch--resolve-agent-shell-buffer)))))
+      (mapc #'kill-buffer (list dispatcher spawned foreign))
+      (delete-directory mine t)
+      (delete-directory other t))))
 
 (ert-deftest wayfinder-diff-and-apply-adds-and-removes ()
   "Incremental diff correctly adds new and removes old tickets."

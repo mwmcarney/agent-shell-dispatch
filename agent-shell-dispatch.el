@@ -10,6 +10,7 @@
 
 (require 'cl-lib)
 (require 'map)
+(require 'project)
 (require 'agent-shell)
 (require 'agent-shell-prompt-queue)
 (require 'agent-shell-dispatch-state)
@@ -138,11 +139,38 @@ With VISIBLE-ONLY, only include buffers visible in a live window."
        (agent-shell-dispatch--agent-shell-buffer-p buf require-dispatch))
      buffers)))
 
+(defun agent-shell-dispatch--project-root (&optional dir)
+  "Return the project root containing DIR (default `default-directory').
+Falls back to DIR itself when it is not inside a project."
+  (let ((default-directory (file-name-as-directory
+                            (expand-file-name (or dir default-directory)))))
+    (or (when-let* ((proj (project-current)))
+          (expand-file-name (project-root proj)))
+        default-directory)))
+
+(defun agent-shell-dispatch--project-dispatcher-buffer (require-dispatch)
+  "Return the single dispatcher shell rooted in the caller's project, or nil.
+A dispatcher is an `agent-shell-mode' buffer that was not spawned by
+dispatch.  This lets emacsclient callers, whose `default-directory' is
+their shell's working directory, find their own session rather than
+whichever shell happens to be in the selected window.  REQUIRE-DISPATCH
+is as in `agent-shell-dispatch--resolve-agent-shell-buffer'."
+  (let* ((root (agent-shell-dispatch--project-root))
+         (matches (cl-remove-if-not
+                   (lambda (buf)
+                     (with-current-buffer buf
+                       (and (null agent-shell-dispatch--primary-buffer)
+                            (file-equal-p (agent-shell-dispatch--project-root) root))))
+                   (agent-shell-dispatch--agent-shell-buffers require-dispatch))))
+    (when (= (length matches) 1)
+      (car matches))))
+
 (defun agent-shell-dispatch--resolve-agent-shell-buffer (&optional buffer require-dispatch)
   "Resolve the `agent-shell-mode' buffer associated with this request.
 BUFFER may be a buffer or buffer name and wins when supplied.  Otherwise,
-prefer the current buffer, then the selected window's buffer, then a single
-visible candidate, then a single live candidate.  With REQUIRE-DISPATCH, only
+prefer the current buffer, then the single dispatcher shell rooted in the
+caller's project, then the selected window's buffer, then a single visible
+candidate, then a single live candidate.  With REQUIRE-DISPATCH, only
 consider buffers with active dispatch state."
   (let ((explicit (and buffer (get-buffer buffer))))
     (cond
@@ -155,6 +183,7 @@ consider buffers with active dispatch state."
       (error "Buffer is not an active agent-shell buffer: %s" (buffer-name explicit)))
      ((agent-shell-dispatch--agent-shell-buffer-p (current-buffer) require-dispatch)
       (current-buffer))
+     ((agent-shell-dispatch--project-dispatcher-buffer require-dispatch))
      ((agent-shell-dispatch--agent-shell-buffer-p (window-buffer (selected-window))
                                                   require-dispatch)
       (window-buffer (selected-window)))

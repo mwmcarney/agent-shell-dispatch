@@ -72,10 +72,18 @@
 
 (defun agent-shell-dispatch-wayfinder--local-effort-dir (effort)
   "Return the absolute path to EFFORT's directory under .scratch/."
-  (let ((root (or (when-let* ((proj (project-current)))
-                    (project-root proj))
-                  default-directory)))
-    (expand-file-name (format ".scratch/%s" effort) root)))
+  (expand-file-name (format ".scratch/%s" effort)
+                    (agent-shell-dispatch--project-root)))
+
+(defun agent-shell-dispatch-wayfinder--parse-ticket-ids (text)
+  "Return the ticket IDs mentioned in a Blocked by line's TEXT.
+Every run of digits is an ID (so \"#4\" and \"04\" both give \"4\");
+prose such as \"None (can start immediately)\" yields nil."
+  (let ((ids nil) (pos 0))
+    (while (string-match "[0-9]+" text pos)
+      (push (number-to-string (string-to-number (match-string 0 text))) ids)
+      (setq pos (match-end 0)))
+    (nreverse ids)))
 
 (defun agent-shell-dispatch-wayfinder--local-parse-ticket (file)
   "Parse a local-markdown wayfinder ticket FILE into a normalized plist."
@@ -93,12 +101,9 @@
                             (when (re-search-forward "^Status:\\s-*\\(\\S-+\\)" nil t)
                               (match-string 1))))
              (blocked-by (progn (goto-char (point-min))
-                                (when (re-search-forward "^Blocked by:[ \t]*\\([^\n]+\\)" nil t)
-                                  (let ((raw (string-trim (match-string 1))))
-                                    (when (not (string-empty-p raw))
-                                      (mapcar (lambda (s)
-                                                (string-trim (replace-regexp-in-string "^0+" "" s)))
-                                              (split-string raw ","))))))))
+                                (when (re-search-forward "^Blocked by:[ \t]*\\([^\n]*\\)" nil t)
+                                  (agent-shell-dispatch-wayfinder--parse-ticket-ids
+                                   (match-string 1))))))
         (when id
           (list :id (replace-regexp-in-string "^0+" "" id)
                 :name (or name basename)
@@ -127,12 +132,9 @@
 
 (defun agent-shell-dispatch-wayfinder--github-parse-blocked-by (body)
   "Extract blocked-by IDs from issue BODY text.
-Looks for lines like 'Blocked by: #1, #2' or 'Blocked by #1, #2'."
-  (when (and body (string-match "^Blocked by:?\\s-*\\(.+\\)" body))
-    (let ((raw (match-string 1 body)))
-      (mapcar (lambda (s)
-                (string-trim (replace-regexp-in-string "^#" "" s)))
-              (split-string raw "[,;]")))))
+Looks for lines like \"Blocked by: #1, #2\" or \"Blocked by #1, #2\"."
+  (when (and body (string-match "^Blocked by:?[ \t]*\\(.*\\)" body))
+    (agent-shell-dispatch-wayfinder--parse-ticket-ids (match-string 1 body))))
 
 (defun agent-shell-dispatch-wayfinder--github-issue-status (issue)
   "Derive normalized status from a GitHub ISSUE plist.
