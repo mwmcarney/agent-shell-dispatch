@@ -379,16 +379,16 @@ and none is selected."
 
 (defun agent-shell-dispatch--rebuild-render-ctx ()
   "Rebuild the render context from current task list.
+An empty task list renders an empty graph.
 Preserves all dispatch state (subscriptions, statuses, agents)."
   (when-let* ((state agent-shell-dispatch--state)
-              (tasks (agent-shell-dispatch-state-tasks state))
               (dispatcher-buffer (agent-shell-dispatch-state-dispatcher-buffer state)))
     (let ((task-defs (mapcar (lambda (task)
                                (agent-shell-dispatch-render-task-make
                                 :id (plist-get task :id)
                                 :name (plist-get task :name)
                                 :depends-on (plist-get task :depends-on)))
-                             tasks)))
+                             (agent-shell-dispatch-state-tasks state))))
       (with-current-buffer (get-buffer dispatcher-buffer)
         (agent-shell-dispatch-render-set-tasks task-defs)))))
 
@@ -456,7 +456,7 @@ Returns non-nil if a task was removed."
   (rx (or (seq word-boundary "ticket" (* space) (? "#") (group-n 1 (+ digit)))
           (seq "#" (group-n 1 (+ digit)))
           ;; Local wayfinder ticket file names, e.g. 03-do-the-thing.md
-          (seq word-boundary (group-n 1 (+ digit)) "-" alpha)))
+          (seq word-boundary (group-n 1 (+ digit)) "-" (+ (any alnum "-")) ".md")))
   "Regexp matching a wayfinder ticket reference; group 1 is the ID.")
 
 (defun agent-shell-dispatch--subagent-call-p (tool-call)

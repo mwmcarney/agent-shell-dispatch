@@ -761,6 +761,19 @@ caller's directory over the selected window's shell and spawned agents."
                                 (gethash "d" sm)))))
     (agent-shell-dispatch-stop)))
 
+(ert-deftest dispatch-remove-last-task-empties-graph ()
+  "Removing every task leaves no node behind in the rendered graph."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start
+     (buffer-name) (list (list :id "a" :name "A" :depends-on nil)))
+    (let* ((resets 0)
+           (agent-shell-dispatch-render-reset-function (lambda () (cl-incf resets))))
+      (should (agent-shell-dispatch-remove-task "a"))
+      (should-not agent-shell-dispatch-render--task-defs)
+      (should-not agent-shell-dispatch-render--ctx)
+      (should (= 1 resets)))
+    (agent-shell-dispatch-stop)))
+
 (ert-deftest dispatch-remove-task-preserves-other-statuses ()
   "Removing a task does not lose status reports for remaining tasks."
   (with-dispatch-buffer
@@ -1000,6 +1013,18 @@ caller's directory over the selected window's shell and spawned agents."
     (should (agent-shell-dispatch-test--task "toolu_1"))
     (should (agent-shell-dispatch-test--task "toolu_2"))
     (should-not (gethash "1" (agent-shell-dispatch-state-statuses agent-shell-dispatch--state)))
+    (agent-shell-dispatch-stop)))
+
+(ert-deftest subagent-hyphenated-number-is-not-a-ticket-reference ()
+  "A number joined to a word, like 2-phase, is not a ticket file name."
+  (with-dispatch-buffer
+    (agent-shell-dispatch-start
+     (buffer-name)
+     (list (list :id "2" :name "2 [T] Second" :depends-on nil)))
+    (agent-shell-dispatch-test--emit-agent-call
+     "toolu_1" :description "Design the 2-phase commit")
+    (should (agent-shell-dispatch-test--task "toolu_1"))
+    (should-not (gethash "2" (agent-shell-dispatch-state-statuses agent-shell-dispatch--state)))
     (agent-shell-dispatch-stop)))
 
 (ert-deftest subagent-background-tracked-until-turn-complete ()

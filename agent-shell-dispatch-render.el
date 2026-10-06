@@ -1104,9 +1104,14 @@ Global — only one advice installation is needed.")
   "Timer that drives header updates while the host buffer is idle.")
 
 (defun agent-shell-dispatch-render-set-tasks (task-defs)
-  "Set TASK-DEFS and prepare the render context."
+  "Set TASK-DEFS and prepare the render context.
+With no TASK-DEFS there is nothing to draw, so the graph is cleared from
+the header until tasks are set again."
   (setq agent-shell-dispatch-render--task-defs task-defs
-        agent-shell-dispatch-render--ctx (agent-shell-dispatch-render-prepare task-defs)))
+        agent-shell-dispatch-render--ctx
+        (when task-defs (agent-shell-dispatch-render-prepare task-defs)))
+  (when (and (null task-defs) agent-shell-dispatch-render-reset-function)
+    (ignore-errors (funcall agent-shell-dispatch-render-reset-function))))
 
 (defun agent-shell-dispatch-render--heartbeat (buf)
   "Force a header update in BUF when the host buffer is idle."
