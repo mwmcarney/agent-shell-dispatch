@@ -313,8 +313,7 @@ and rendered on the next turn-complete.")
 (defvar agent-shell-dispatch-msg--pending-input-agents nil
   "List of agent buffer names waiting for dispatcher input.")
 
-(defun agent-shell-dispatch-msg--cleanup-permission
-    (perm-id target-buf _agent-buf _option-id)
+(defun agent-shell-dispatch-msg--cleanup-permission (perm-id target-buf)
   "Remove the permission fragment identified by PERM-ID from TARGET-BUF.
 Deletes the fragment using its block-id (same as PERM-ID)."
   (when-let* ((buf (get-buffer target-buf)))
@@ -326,29 +325,25 @@ Deletes the fragment using its block-id (same as PERM-ID)."
       (agent-shell-chat--schedule-relabel))))
 
 (defun agent-shell-dispatch-msg--make-respond-action
-    (respond option-id agent-buf perm-id target-name)
-  "Create a permission button action calling RESPOND and cleaning up.
-OPTION-ID, AGENT-BUF, PERM-ID, and TARGET-NAME identify the dialog."
+    (respond option-id perm-id target-name)
+  "Create a permission button action calling RESPOND with OPTION-ID.
+Then removes the dialog PERM-ID from TARGET-NAME."
   (lambda ()
     (interactive)
     (funcall respond option-id)
-    (setq agent-shell-dispatch-msg--pending-permission-agents
-          (delete agent-buf
-                  agent-shell-dispatch-msg--pending-permission-agents))
-    (agent-shell-dispatch-msg--cleanup-permission
-     perm-id target-name agent-buf option-id)
+    (agent-shell-dispatch-msg--cleanup-permission perm-id target-name)
     (goto-char (point-max))))
 
 (defun agent-shell-dispatch-msg--make-permission-buttons
-    (options keymap respond agent-buf perm-id target-name)
+    (options keymap respond perm-id target-name)
   "Build permission button string from OPTIONS, binding keys in KEYMAP.
-RESPOND is called with the chosen option-id.  AGENT-BUF, PERM-ID, and
-TARGET-NAME are forwarded to the response action."
+RESPOND is called with the chosen option-id.  PERM-ID and TARGET-NAME
+are forwarded to the response action."
   (mapconcat
    (lambda (opt)
      (let ((action (agent-shell-dispatch-msg--make-respond-action
                     respond (map-elt opt :option-id)
-                    agent-buf perm-id target-name)))
+                    perm-id target-name)))
        (when-let* ((char-str (map-elt opt :char)))
          (define-key keymap (kbd char-str) action))
        (agent-shell--make-permission-button
@@ -362,11 +357,11 @@ TARGET-NAME are forwarded to the response action."
    options " "))
 
 (defun agent-shell-dispatch-msg--make-view-button
-    (diff options respond keymap agent-buf perm-id target-name)
+    (diff options respond keymap perm-id target-name)
   "Create a View (v) button that opens ediff for DIFF.
 OPTIONS and RESPOND wire accept/reject in the ediff session.
-KEYMAP receives the `v' binding.  AGENT-BUF, PERM-ID, and TARGET-NAME
-identify the dialog to remove on accept/reject."
+KEYMAP receives the `v' binding.  PERM-ID and TARGET-NAME identify the
+dialog to remove on accept/reject."
   (let* ((old (map-elt diff :old))
          (new (map-elt diff :new))
          (file (map-elt diff :file))
@@ -387,21 +382,13 @@ identify the dialog to remove on accept/reject."
              :on-accept (when accept-opt
                           (lambda ()
                             (funcall respond (map-elt accept-opt :option-id))
-                            (setq agent-shell-dispatch-msg--pending-permission-agents
-                                  (delete agent-buf
-                                          agent-shell-dispatch-msg--pending-permission-agents))
                             (agent-shell-dispatch-msg--cleanup-permission
-                             perm-id target-name agent-buf
-                             (map-elt accept-opt :option-id))))
+                             perm-id target-name)))
              :on-reject (when reject-opt
                           (lambda ()
                             (funcall respond (map-elt reject-opt :option-id))
-                            (setq agent-shell-dispatch-msg--pending-permission-agents
-                                  (delete agent-buf
-                                          agent-shell-dispatch-msg--pending-permission-agents))
                             (agent-shell-dispatch-msg--cleanup-permission
-                             perm-id target-name agent-buf
-                             (map-elt reject-opt :option-id))))))))
+                             perm-id target-name)))))))
     (define-key keymap "v" view-action)
     (agent-shell--make-permission-button
      :text "View (v)"
@@ -430,12 +417,12 @@ Returns propertized text with keymap for button interaction."
                          agent-shell-dispatch--primary-buffer ""))
          ;; Build option buttons
          (buttons (agent-shell-dispatch-msg--make-permission-buttons
-                   options keymap respond agent-buf perm-id
+                   options keymap respond perm-id
                    target-name))
          ;; Add View button if diff available
          (view-btn (when diff
                      (agent-shell-dispatch-msg--make-view-button
-                      diff options respond keymap agent-buf perm-id
+                      diff options respond keymap perm-id
                       target-name)))
          (all-buttons (if view-btn
                          (concat view-btn " " buttons)
@@ -567,6 +554,17 @@ is non-nil."
 
 ;; ── Handle methods ──────────────────────────────────────────────────
 
+(defun agent-shell-dispatch-msg-queue-prompt (target-buf prompt)
+  "Queue PROMPT for the shell in TARGET-BUF, sending it now if that shell is idle.
+A busy shell sends it when its turn ends.  Prompts always queue rather than
+steer, since steering can make the agent drop work in progress.
+Does nothing when TARGET-BUF is gone."
+  (when-let* ((buf (get-buffer target-buf)))
+    (with-current-buffer buf
+      (agent-shell--prompt-queue-enqueue :prompt prompt)
+      (unless (shell-maker-busy)
+        (agent-shell--prompt-queue-process-next)))))
+
 (cl-defmethod agent-shell-dispatch-msg-handle
   ((msg agent-shell-dispatch-msg-task-completed) target-buf)
   "Notify the dispatcher that a subagent has completed its task.
@@ -574,12 +572,9 @@ Queues a prompt so the dispatcher can review and mark the task done."
   (let ((agent (agent-shell-dispatch-msg-agent-buffer msg))
         (task-id (agent-shell-dispatch-msg-task-completed-task-id msg))
         (summary (agent-shell-dispatch-msg-task-completed-summary msg)))
-    (when-let* ((buf (get-buffer target-buf)))
-      (with-current-buffer buf
-        (agent-shell--prompt-queue-enqueue
-         :prompt (format "[Task Complete: %s (task: %s)]\n\n%s" agent task-id summary))
-        (unless (shell-maker-busy)
-          (agent-shell--prompt-queue-process-next))))))
+    (agent-shell-dispatch-msg-queue-prompt
+     target-buf
+     (format "[Task Complete: %s (task: %s)]\n\n%s" agent task-id summary))))
 
 (cl-defmethod agent-shell-dispatch-msg-handle
   ((msg agent-shell-dispatch-msg-error) target-buf)
@@ -589,14 +584,11 @@ Queues a prompt so the dispatcher can update the task graph."
         (task-id (agent-shell-dispatch-msg-error-task-id msg))
         (desc (agent-shell-dispatch-msg-error-description msg))
         (ctx (agent-shell-dispatch-msg-error-context msg)))
-    (when-let* ((buf (get-buffer target-buf)))
-      (with-current-buffer buf
-        (agent-shell--prompt-queue-enqueue
-         :prompt (format "[Task Error: %s (task: %s)]\n\n%s%s"
-                         agent task-id desc
-                         (if ctx (format "\n\nContext: %s" ctx) "")))
-        (unless (shell-maker-busy)
-          (agent-shell--prompt-queue-process-next))))))
+    (agent-shell-dispatch-msg-queue-prompt
+     target-buf
+     (format "[Task Error: %s (task: %s)]\n\n%s%s"
+             agent task-id desc
+             (if ctx (format "\n\nContext: %s" ctx) "")))))
 
 (cl-defmethod agent-shell-dispatch-msg-handle
   ((msg agent-shell-dispatch-msg-input-needed) target-buf)
@@ -605,17 +597,14 @@ Also tracks the agent as waiting for input."
   (let ((agent (agent-shell-dispatch-msg-agent-buffer msg)))
     (cl-pushnew agent agent-shell-dispatch-msg--pending-input-agents
                 :test #'equal)
-    (when-let* ((buf (get-buffer target-buf)))
-      (with-current-buffer buf
-        (let ((question (agent-shell-dispatch-msg-input-needed-question msg))
-              (context (agent-shell-dispatch-msg-input-needed-context msg)))
-          (agent-shell--prompt-queue-enqueue
-           :prompt (format "[Input Needed: %s]\n\n%s%s\n\nRespond via (agent-shell-dispatch-send-to-agent \"%s\" YOUR_ANSWER \"dispatcher\")"
-                           agent question
-                           (if context (format "\n\nContext: %s" context) "")
-                           agent))
-          (unless (shell-maker-busy)
-            (agent-shell--prompt-queue-process-next)))))))
+    (let ((question (agent-shell-dispatch-msg-input-needed-question msg))
+          (context (agent-shell-dispatch-msg-input-needed-context msg)))
+      (agent-shell-dispatch-msg-queue-prompt
+       target-buf
+       (format "[Input Needed: %s]\n\n%s%s\n\nRespond via (agent-shell-dispatch-send-to-agent \"%s\" YOUR_ANSWER \"dispatcher\")"
+               agent question
+               (if context (format "\n\nContext: %s" context) "")
+               agent)))))
 
 (provide 'agent-shell-dispatch-messages)
 ;;; agent-shell-dispatch-messages.el ends here

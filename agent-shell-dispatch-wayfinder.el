@@ -539,8 +539,6 @@ Requires an active wayfinder effort."
             ;; Spawn the agent and wire it to this task
             (let ((agent-buf (agent-shell-dispatch-spawn-agent default-directory agent-name prompt)))
               (when agent-buf
-                (setq agent-shell-dispatch-msg--pending-permission-agents
-                      (delete agent-buf agent-shell-dispatch-msg--pending-permission-agents))
                 (when-let* ((state agent-shell-dispatch--state)
                             (task (cl-find-if
                                    (lambda (t_) (equal (plist-get t_ :id) id-normalized))

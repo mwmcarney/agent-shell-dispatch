@@ -1,5 +1,7 @@
 ;;; agent-shell-dispatch.el --- Multi-agent dispatch for agent-shell -*- lexical-binding: t; -*-
 
+;; Package-Requires: ((emacs "29.1") (agent-shell "0.84.2"))
+
 ;;; Commentary:
 
 ;; Agent lifecycle, status resolution, and dispatch coordination.
@@ -24,7 +26,7 @@
 (declare-function agent-shell--update-header-and-mode-line "agent-shell")
 (declare-function agent-shell--make-permission-button "agent-shell")
 (declare-function agent-shell-subscribe-to "agent-shell")
-(declare-function agent-shell--prompt-queue-enqueue "agent-shell-prompt-queue")
+(declare-function agent-shell-insert "agent-shell")
 (declare-function agent-shell--prompt-queue-process-next "agent-shell-prompt-queue")
 (defvar agent-shell--state)
 (defvar agent-shell--header-cache)
@@ -79,8 +81,8 @@ subagent buffer -- the SVG status icon still updates either way."
 (defun agent-shell-dispatch--prune-stale-permissions ()
   "Remove entries from the pending permission list for idle agents.
 An agent blocked on permission is still busy (its turn is suspended).
-An idle agent's entry is stale — the permission was resolved or the
-agent was interrupted."
+Answered permissions clear themselves, so this is a safety net for
+entries whose agent buffer went away first."
   (setq agent-shell-dispatch-msg--pending-permission-agents
         (seq-filter
          (lambda (agent-buf)
@@ -665,6 +667,8 @@ Also stops dispatch rendering. Returns the number of agents killed."
   "Start a new Claude `agent-shell' for dispatch using CONFIG.
 No window popup, no session prompt.  Copies the session mode from the
 primary (dispatcher) buffer.  Permissions are rendered in the dispatcher buffer.
+The agent shows as blocked on a permission until agent-shell reports it
+answered, however that happens.
 BUFFER-NAME, if provided, is incorporated into the buffer label."
   (let* ((cfg (copy-alist config))
          (primary (or agent-shell-dispatch--primary-buffer (buffer-name)))
@@ -687,28 +691,35 @@ BUFFER-NAME, if provided, is incorporated into the buffer label."
       (with-current-buffer buf
         (setq-local agent-shell-dispatch--primary-buffer primary
                     agent-shell-permission-responder-function
-                    #'agent-shell-dispatch-forward-permission)))
+                    #'agent-shell-dispatch-forward-permission)
+        (agent-shell-dispatch--clear-permission-lock)
+        (agent-shell-subscribe-to
+         :shell-buffer buf
+         :event 'permission-response
+         :on-event (lambda (_event) (agent-shell-dispatch--clear-permission-lock)))))
     buf))
+
+(defun agent-shell-dispatch--clear-permission-lock ()
+  "Stop showing the current agent as blocked on a permission."
+  (setq agent-shell-dispatch-msg--pending-permission-agents
+        (delete (buffer-name) agent-shell-dispatch-msg--pending-permission-agents)))
 
 ;; -- Multi-agent coordination --
 
 (defun agent-shell-dispatch-spawn-agent (dir name &optional initial-message)
   "Spawn a background agent in DIR with NAME.
-Sends INITIAL-MESSAGE after a brief delay if provided.
+Submits INITIAL-MESSAGE, if provided, once the agent's session is ready.
 Returns the buffer name."
   (let* ((default-directory (expand-file-name dir))
          (buf (agent-shell-dispatch-start-agent
                (agent-shell-anthropic-make-claude-code-config)
                nil name)))
     (when (and buf (buffer-live-p buf) initial-message)
-      (run-at-time 1 nil
-                   (lambda (b msg)
-                     (when (buffer-live-p b)
-                       (with-current-buffer b
-                         (agent-shell--prompt-queue-enqueue :prompt msg)
-                         (unless (shell-maker-busy)
-                           (agent-shell--prompt-queue-process-next)))))
-                   buf initial-message))
+      ;; Insert from the agent's own buffer so a viewport preference
+      ;; doesn't redirect it; agent-shell waits for the session to be ready.
+      (with-current-buffer buf
+        (agent-shell-insert :text initial-message :submit t :no-focus t
+                            :shell-buffer buf)))
     (when (buffer-live-p buf)
       ;; Register in dispatcher's agent set (keyed by display name)
       (when-let* ((state agent-shell-dispatch--state)
@@ -742,16 +753,12 @@ Returns list of plists with :buffer and :status."
 FROM identifies the sender. Queues if agent is busy.
 Clears any pending input-needed state for BUFFER-NAME.
 Returns t on success, nil if buffer not found."
-  (when-let* ((buf (get-buffer buffer-name)))
+  (when (get-buffer buffer-name)
     (setq agent-shell-dispatch-msg--pending-input-agents
           (delete buffer-name agent-shell-dispatch-msg--pending-input-agents))
-    (with-current-buffer buf
-      (let ((prompt (if from
-                        (format "[From: %s]\n\n%s" from message)
-                      message)))
-        (agent-shell--prompt-queue-enqueue :prompt prompt)
-        (unless (shell-maker-busy)
-          (agent-shell--prompt-queue-process-next))))
+    (agent-shell-dispatch-msg-queue-prompt
+     buffer-name
+     (if from (format "[From: %s]\n\n%s" from message) message))
     t))
 
 (defun agent-shell-dispatch-view-agent (buffer-name &optional num-lines)

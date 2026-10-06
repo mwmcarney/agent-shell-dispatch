@@ -46,13 +46,21 @@
   (defun agent-shell-anthropic-make-claude-code-config () nil)
   (defun agent-shell-cycle-session-mode (&optional _on-success) nil)
   (defun agent-shell-set-session-mode (&optional _on-success) nil)
+  ;; Insertions are recorded as (CURRENT-BUFFER . ARGS)
+  (defvar agent-shell-test--insertions nil)
+  (cl-defun agent-shell-insert (&rest args)
+    (push (cons (current-buffer) args) agent-shell-test--insertions)
+    nil)
   (provide 'agent-shell))
 
 (unless (featurep 'agent-shell-prompt-queue)
   (defvar agent-shell-prompt-queue--entries nil)
   (defun agent-shell--prompt-queue-enqueue (&rest args)
     (push args agent-shell-prompt-queue--entries))
-  (defun agent-shell--prompt-queue-process-next () nil)
+  ;; Counts how often the queue was told to send, keyed by buffer
+  (defvar agent-shell-test--queue-sends nil)
+  (defun agent-shell--prompt-queue-process-next ()
+    (push (current-buffer) agent-shell-test--queue-sends))
   (provide 'agent-shell-prompt-queue))
 
 (unless (featurep 'agent-shell-ui)
@@ -1347,6 +1355,121 @@ SCALE is how much larger the image is displayed than its SVG size."
           (should-not (memq #'agent-shell-dispatch-wayfinder-unload
                             agent-shell-dispatch-dismiss-hook)))
       (delete-directory root t))))
+
+;; ── Permission lock follows agent-shell's permission events ────────────
+
+(defmacro agent-shell-dispatch-test--with-spawned-agent (agent &rest body)
+  "Run BODY in a dispatcher shell with AGENT bound to a spawned agent's buffer."
+  (declare (indent 1))
+  `(let ((agent-shell-dispatch-msg--pending-permission-agents nil)
+         (agent-shell-dispatch-msg-show-permissions-in-dispatcher nil))
+     (with-dispatch-buffer
+       (let ((dispatcher (current-buffer)))
+         (with-dispatch-buffer
+           (let ((,agent (current-buffer)))
+             (with-current-buffer dispatcher
+               (cl-letf (((symbol-function 'agent-shell--start) (lambda (&rest _) ,agent)))
+                 (agent-shell-dispatch-start-agent nil nil "worker")))
+             ,@body))))))
+
+(defun agent-shell-dispatch-test--request-permission (agent)
+  "Have AGENT ask for permission through its responder, as agent-shell does."
+  (with-current-buffer agent
+    (funcall agent-shell-permission-responder-function
+             (list (cons :tool-call '((:title . "Edit file") (:kind . "edit")))
+                   (cons :options nil)
+                   (cons :respond #'ignore)))))
+
+(ert-deftest permission-lock-clears-when-agent-answers ()
+  "An agent's permission lock clears once agent-shell reports the permission answered.
+This holds however it was answered: a dispatcher button, the agent's own
+buffer, or an interrupt rejecting it."
+  (agent-shell-dispatch-test--with-spawned-agent agent
+    (agent-shell-dispatch-test--request-permission agent)
+    (should (member (buffer-name agent) agent-shell-dispatch-msg--pending-permission-agents))
+    (agent-shell-dispatch-test--emit agent 'permission-response
+                                     '((:option-id . "allow") (:cancelled . nil)))
+    (should-not (member (buffer-name agent) agent-shell-dispatch-msg--pending-permission-agents))))
+
+(ert-deftest permission-lock-cleared-for-newly-started-agent ()
+  "A newly started agent has no permission lock left from an earlier one of the same name."
+  (let ((agent-shell-dispatch-msg--pending-permission-agents nil))
+    (with-dispatch-buffer
+      (let ((agent (current-buffer)))
+        (setq agent-shell-dispatch-msg--pending-permission-agents (list (buffer-name agent)))
+        (cl-letf (((symbol-function 'agent-shell--start) (lambda (&rest _) agent)))
+          (agent-shell-dispatch-start-agent nil nil "worker"))
+        (should-not agent-shell-dispatch-msg--pending-permission-agents)))))
+
+;; ── Spawned agent's first message ─────────────────────────────────────
+
+(ert-deftest spawn-agent-submits-initial-message-to-new-agent ()
+  "A spawned agent's first message is submitted into that agent's own shell.
+agent-shell holds the submission until the new session is ready, so it is
+handed over straight away rather than after a guessed delay."
+  (let ((agent-shell-test--insertions nil))
+    (with-dispatch-buffer
+      (let ((agent (current-buffer)))
+        (with-temp-buffer
+          (cl-letf (((symbol-function 'agent-shell--start) (lambda (&rest _) agent)))
+            (agent-shell-dispatch-spawn-agent default-directory "worker" "Research: caching")))
+        (should (= 1 (length agent-shell-test--insertions)))
+        (pcase-let ((`(,current . ,args) (car agent-shell-test--insertions)))
+          ;; Inserting from the agent's buffer keeps it out of any viewport
+          (should (eq current agent))
+          (should (eq (plist-get args :shell-buffer) agent))
+          (should (equal (plist-get args :text) "Research: caching"))
+          (should (plist-get args :submit))
+          (should (plist-get args :no-focus)))))))
+
+;; ── Prompts queued for a shell ───────────────────────────────────────
+
+(defun agent-shell-dispatch-test--prompt-senders (target)
+  "Return functions that each queue one dispatch prompt for TARGET's shell."
+  (let ((name (buffer-name target)))
+    (list
+     (lambda () (agent-shell-dispatch-send-to-agent name "Use v2" "dispatcher"))
+     (lambda () (agent-shell-dispatch-msg-handle
+                 (agent-shell-dispatch-msg-task-completed-make
+                  :agent-buffer "[agent:w]" :timestamp (current-time)
+                  :task-id "a" :summary "Done.")
+                 name))
+     (lambda () (agent-shell-dispatch-msg-handle
+                 (agent-shell-dispatch-msg-error-make
+                  :agent-buffer "[agent:w]" :timestamp (current-time)
+                  :task-id "a" :description "Broke" :context nil)
+                 name))
+     (lambda () (agent-shell-dispatch-msg-handle
+                 (agent-shell-dispatch-msg-input-needed-make
+                  :agent-buffer "[agent:w]" :timestamp (current-time)
+                  :question "Which?" :context nil)
+                 name)))))
+
+(ert-deftest queued-prompt-sent-at-once-to-idle-shell ()
+  "Every dispatch prompt is queued, and sent straight away when its shell is idle."
+  (let ((agent-shell-dispatch-msg--pending-input-agents nil))
+    (with-dispatch-buffer
+      (let ((target (current-buffer)))
+        (dolist (send (agent-shell-dispatch-test--prompt-senders target))
+          (let ((agent-shell-prompt-queue--entries nil)
+                (agent-shell-test--queue-sends nil)
+                (shell-maker-busy-val nil))
+            (with-temp-buffer (funcall send))
+            (should (= 1 (length agent-shell-prompt-queue--entries)))
+            (should (equal (list target) agent-shell-test--queue-sends))))))))
+
+(ert-deftest queued-prompt-waits-for-busy-shell ()
+  "A dispatch prompt for a busy shell waits in its queue for the turn to end."
+  (let ((agent-shell-dispatch-msg--pending-input-agents nil))
+    (with-dispatch-buffer
+      (let ((target (current-buffer)))
+        (dolist (send (agent-shell-dispatch-test--prompt-senders target))
+          (let ((agent-shell-prompt-queue--entries nil)
+                (agent-shell-test--queue-sends nil)
+                (shell-maker-busy-val t))
+            (with-temp-buffer (funcall send))
+            (should (= 1 (length agent-shell-prompt-queue--entries)))
+            (should-not agent-shell-test--queue-sends)))))))
 
 (provide 'agent-shell-dispatch-integration-test)
 ;;; agent-shell-dispatch-integration-test.el ends here

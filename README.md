@@ -13,7 +13,7 @@ Multi-agent dispatch and coordination for [agent-shell](https://github.com/xenod
 - **Automatic graphs** -- a shell's first Claude Code subagent starts its task graph without any dispatch call
 - **One graph per shell** -- each agent-shell buffer has its own graph and state, so several shells can show graphs at once
 - **Click to dismiss** -- a graph stays up until you click the × at its top right; dismissing a wayfinder graph also unloads its effort
-- **Permission forwarding** -- tool permission requests from background agents show as a lock icon in the SVG header; the native permission UI appears in the subagent's own buffer by default (optionally rendered in the dispatcher via `agent-shell-dispatch-msg-show-permissions-in-dispatcher`)
+- **Permission forwarding** -- tool permission requests from background agents show as a lock icon in the SVG header; the native permission UI appears in the subagent's own buffer by default (optionally rendered in the dispatcher via `agent-shell-dispatch-msg-show-permissions-in-dispatcher`); the lock clears as soon as agent-shell reports the permission answered, wherever it was answered
 - **Inter-agent messaging** -- typed message protocol for progress reports, error reports, input requests, and completion notifications
 - **Dispatcher pattern** -- the primary agent coordinates without implementing; subagents communicate via messages only, and the dispatcher owns all task graph updates
 - **Agent activity tracker** -- a compact column on the left of the task graph shows each agent's busy/idle state in real-time, auto-wrapping to multiple columns when needed
@@ -58,7 +58,7 @@ Clone this repository and add it to your `load-path`:
 ## Requirements
 
 - Emacs 29+ (for SVG support and `text-property-search-forward`)
-- [agent-shell](https://github.com/xenodium/agent-shell)
+- [agent-shell](https://github.com/xenodium/agent-shell) 0.84.2+ (for its event subscriptions and `agent-shell-insert`)
 
 ## Usage
 
